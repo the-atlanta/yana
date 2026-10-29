@@ -5,9 +5,14 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[[bin]]
+name = "yana-lsp"
+path = "src/main.rs"
+
 [dependencies]
 yana-ast = { workspace = true }
 yana-lexer = { workspace = true }
 yana-parser = { workspace = true }
+yana-codegen = { workspace = true }
 tower-lsp = { workspace = true }
 tokio = { workspace = true }

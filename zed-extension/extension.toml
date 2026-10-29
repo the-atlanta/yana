@@ -1,0 +1,14 @@
+id = "yana"
+name = "YANA"
+version = "0.1.0"
+description = "YANA (Yet Another New Assembly) — highlighting, LSP diagnostics, completions and hover for x86-64 assembly with contracts."
+repository = "https://github.com/the-atlanta/yana"
+authors = ["Nikki Kagamin"]
+schema_version = 1
+
+[language_servers.yana-lsp]
+name = "YANA Language Server"
+languages = ["YANA"]
+
+[grammars.yana]
+repository = "file://./grammars/yana"

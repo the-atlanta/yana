@@ -1,0 +1,17 @@
+{
+  "name": "tree-sitter-yana",
+  "version": "0.1.0",
+  "description": "YANA grammar for tree-sitter (Zed highlighting)",
+  "main": "bindings/node",
+  "scripts": {
+    "generate": "tree-sitter generate",
+    "parse": "tree-sitter parse"
+  },
+  "tree-sitter": [
+    {
+      "scope": "source.yana",
+      "file-types": ["yana", "yn"],
+      "highlights": "queries/highlights.scm"
+    }
+  ]
+}
