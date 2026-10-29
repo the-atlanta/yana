@@ -1,0 +1,670 @@
+//! The YANA grammar (LALRPOP).
+//!
+//! Input: `(usize, Token, usize)` triples from `yana-lexer` (comments already
+//! stripped — they travel through the trivia side channel). Output: `File`.
+//!
+//! Fallible actions (`=>?`) fail with synthetic error tokens that carry spans
+//! ([`Token::BadNum`] etc.); the driver turns them into precise diagnostics.
+
+use yana_ast::{
+    Attr, AttrArg, AssignOp, Block, BranchCond, CallArg, CallResults, CmpOp, ConstBinOp,
+    ConstExpr, ConstUnOp, Clobbers, File, Flag, Item, Param, Place, RetSig, Span, Stmt, Ty, Value,
+};
+use yana_ast::place::{MemTerm, RawAddr};
+use yana_ast::reg::Reg;
+use yana_lexer::Token;
+use crate::gram::{self, Sp};
+
+grammar;
+
+extern {
+    type Location = usize;
+    type Error = Token;
+
+    enum Token {
+        "bind"     => Token::KwBind,
+        "mut"      => Token::KwMut,
+        "alt"      => Token::KwAlt,
+        "push"     => Token::KwPush,
+        "pop"      => Token::KwPop,
+        "branch"   => Token::KwBranch,
+        "call"     => Token::KwCall,
+        "return"   => Token::KwReturn,
+        "syscall"  => Token::KwSyscall,
+        "label"    => Token::KwLabel,
+        "fn"       => Token::KwFn,
+        "extern"   => Token::KwExtern,
+        "pub"      => Token::KwPub,
+        "const"    => Token::KwConst,
+        "clobbers" => Token::KwClobbers,
+        "as"       => Token::KwAs,
+        "align"    => Token::KwAlign,
+        "atomic"   => Token::KwAtomic,
+        "volatile" => Token::KwVolatile,
+        "true"     => Token::KwTrue,
+        "false"    => Token::KwFalse,
+        "if"       => Token::KwIf,
+        "else"     => Token::KwElse,
+        "let"      => Token::KwLet,
+        "for"      => Token::KwFor,
+        "preserves"=> Token::KwPreserves,
+        "requires" => Token::KwRequires,
+        "ensures"  => Token::KwEnsures,
+        "invariant"=> Token::KwInvariant,
+        "use"      => Token::KwUse,
+        "mod"      => Token::KwMod,
+        "macro"    => Token::KwMacro,
+        "macro_rules" => Token::KwMacroRules,
+
+        "u8"    => Token::Tu8,
+        "u16"   => Token::Tu16,
+        "u32"   => Token::Tu32,
+        "u64"   => Token::Tu64,
+        "u128"  => Token::Tu128,
+        "usize" => Token::Tusize,
+        "i8"    => Token::Ti8,
+        "i16"   => Token::Ti16,
+        "i32"   => Token::Ti32,
+        "i64"   => Token::Ti64,
+        "i128"  => Token::Ti128,
+        "isize" => Token::Tisize,
+
+        "zero"     => Token::FlagZero,
+        "carry"    => Token::FlagCarry,
+        "negative" => Token::FlagNegative,
+        "overflow" => Token::FlagOverflow,
+        "even"     => Token::FlagEven,
+
+        ";"   => Token::Semi,
+        ","   => Token::Comma,
+        ":"   => Token::Colon,
+        "::"  => Token::ColonColon,
+        "@"   => Token::At,
+        "&"   => Token::Amp,
+        "->"  => Token::Arrow,
+        "=>"  => Token::FatArrow,
+        "/%"  => Token::SlashPercent,
+        "="   => Token::Eq,
+        "+="  => Token::PlusEq,
+        "-="  => Token::MinusEq,
+        "*="  => Token::StarEq,
+        "^="  => Token::CaretEq,
+        "&="  => Token::AmpEq,
+        "|="  => Token::PipeEq,
+        "<<=" => Token::ShlEq,
+        ">>=" => Token::ShrEq,
+        "=="  => Token::EqEq,
+        "!="  => Token::Ne,
+        "<="  => Token::Le,
+        ">="  => Token::Ge,
+        "&&"  => Token::AmpAmp,
+        "||"  => Token::PipePipe,
+        "<<"  => Token::Shl,
+        ">>"  => Token::Shr,
+        ".."  => Token::DotDot,
+        "#["  => Token::HashLBracket,
+        "<"   => Token::Lt,
+        ">"   => Token::Gt,
+        "!"   => Token::Bang,
+        "+"   => Token::Plus,
+        "-"   => Token::Minus,
+        "*"   => Token::Star,
+        "/"   => Token::Slash,
+        "%"   => Token::Percent,
+        "^"   => Token::Caret,
+        "|"   => Token::Pipe,
+        "."   => Token::Dot,
+        "("   => Token::LParen,
+        ")"   => Token::RParen,
+        "{"   => Token::LBrace,
+        "}"   => Token::RBrace,
+        "["   => Token::LBracket,
+        "]"   => Token::RBracket,
+        "#"   => Token::Hash,
+
+        "ident" => Token::Ident(<String>),
+        "num"   => Token::Num(<String>),
+        "char"  => Token::Char(<u8>),
+        "str"   => Token::Str(<String>),
+        "lbl"   => Token::LabelRef(<String>),
+        "pair"  => Token::PairReg(<(yana_ast::reg::Reg, yana_ast::reg::Reg, u32, u32)>),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// spanned primitives
+// ---------------------------------------------------------------------------
+
+IdentSp: Sp<String> = {
+    <lo: @L> <s: "ident"> <hi: @R> => Sp { v: s, span: Span::new(lo as u32, hi as u32) },
+};
+
+NumSp: i128 = {
+    <lo: @L> <s: "num"> <hi: @R> =>? gram::parse_int(&s, Span::new(lo as u32, hi as u32)),
+};
+
+StrSp: Vec<u8> = {
+    <lo: @L> <s: "str"> <hi: @R> =>? gram::parse_str(&s, Span::new(lo as u32, hi as u32)),
+};
+
+CharVal: i128 = {
+    <c: "char"> => c as i128,
+};
+
+// ---------------------------------------------------------------------------
+// types (§2)
+// ---------------------------------------------------------------------------
+
+Ty: Ty = {
+    "u8"    => Ty::U8,
+    "u16"   => Ty::U16,
+    "u32"   => Ty::U32,
+    "u64"   => Ty::U64,
+    "u128"  => Ty::U128,
+    "usize" => Ty::Usize,
+    "i8"    => Ty::I8,
+    "i16"   => Ty::I16,
+    "i32"   => Ty::I32,
+    "i64"   => Ty::I64,
+    "i128"  => Ty::I128,
+    "isize" => Ty::Isize,
+    "*" <t: Ty> => Ty::Ptr(Box::new(t)),
+    "[" <t: Ty> ";" <n: NumSp> "]" => Ty::Array(Box::new(t), n as u64),
+    "[" <t: Ty> "]" => Ty::Slice(Box::new(t)),
+    "(" <a: Ty> <rest: ("," <Ty>)*> ")" => {
+        let mut v = vec![a];
+        v.extend(rest);
+        Ty::Tuple(v)
+    },
+};
+
+OptTy: Option<Ty> = {
+    => None,
+    ":" <t: Ty> => Some(t),
+};
+
+// ---------------------------------------------------------------------------
+// places (§3)
+// ---------------------------------------------------------------------------
+
+// a memory-address term: register / name / scaled register / constant
+MemTermEl: MemTerm = {
+    <i: IdentSp> =>? {
+        let p = gram::ident_place(&i.v, i.span);
+        match p {
+            Place::Reg { reg, .. } => Ok(MemTerm::Reg(reg)),
+            Place::Named { name, .. } => Ok(MemTerm::Name(name)),
+            _ => Err(gram::bad_reg_err(i.v.clone(), i.span)),
+        }
+    },
+    <i: IdentSp> "*" <s: NumSp> =>? {
+        match gram::ident_place(&i.v, i.span) {
+            Place::Reg { reg, .. } => Ok(MemTerm::RegScaled { reg, scale: s as u8 }),
+            Place::Named { name, .. } => Ok(MemTerm::NameScaled { name, scale: s as u8 }),
+            _ => Err(gram::bad_reg_err(i.v.clone(), i.span)),
+        }
+    },
+    <n: NumSp> => MemTerm::Const(n as i64),
+};
+
+MemTermRest: gram::SignedTerm = {
+    "+" <t: MemTermEl> => gram::SignedTerm { neg: false, term: t },
+    // `-8` / `-sym` go through MemTermEl so there is exactly one path
+    "-" <t: MemTermEl> => gram::SignedTerm { neg: true, term: t },
+};
+
+RawAddr: RawAddr = {
+    <lo: @L> "[" <h: MemTermEl> <rest: MemTermRest*> "]" <hi: @R> =>
+        gram::build_addr(h, rest, Span::new(lo as u32, hi as u32)),
+};
+
+// Places come in two flavors because `:` is context-dependent:
+// - PlaceUntyped: no type annotation may follow (inside values, call args,
+//   push/pop, mem terms) — avoids reduce/shift conflicts with named call args.
+// - PlaceTyped: `ident [: Ty]` / `pair [: Ty]` / `[addr] [: Ty]` — used where
+//   an annotation is meaningful (bind, alt dst, return, params, ret sig).
+
+PlaceUntyped: Place = {
+    <i: IdentSp> => gram::ident_place(&i.v, i.span),
+    <p: "pair"> => Place::RegPair { hi: p.0, lo: p.1, ty: None, span: Span::new(p.2, p.3) },
+    <a: RawAddr> => { let span = a.span; Place::Mem { addr: a, ty: None, span } },
+    // optional size annotation on a memory operand (§3): `@[rbx+rcx*8+16]: u64`
+    <a: RawAddr> ":" <t: Ty> => { let span = a.span; Place::Mem { addr: a, ty: Some(t), span } },
+};
+
+PlaceTyped: Place = {
+    <i: IdentSp> => gram::ident_place(&i.v, i.span),
+    <i: IdentSp> ":" <t: Ty> => gram::ident_place(&i.v, i.span).with_ty(Some(t)),
+    <p: "pair"> => Place::RegPair { hi: p.0, lo: p.1, ty: None, span: Span::new(p.2, p.3) },
+    <p: "pair"> ":" <t: Ty> => Place::RegPair { hi: p.0, lo: p.1, ty: Some(t), span: Span::new(p.2, p.3) },
+    <a: RawAddr> => { let span = a.span; Place::Mem { addr: a, ty: None, span } },
+    <a: RawAddr> ":" <t: Ty> => { let span = a.span; Place::Mem { addr: a, ty: Some(t), span } },
+};
+
+// ---------------------------------------------------------------------------
+// values (§4)
+// ---------------------------------------------------------------------------
+
+AtomVal: Value = {
+    <p: PlaceUntyped> => Value::Place(p),
+    <n: NumSp> => Value::Imm { value: n, span: Span::DUMMY },
+    <lo: @L> "-" <n: NumSp> <hi: @R> => Value::Imm { value: -n, span: Span::new(lo as u32, hi as u32) },
+    <c: CharVal> => Value::Imm { value: c, span: Span::DUMMY },
+    <s: StrSp> => Value::Str { bytes: s, span: Span::DUMMY },
+    "const" "{" <e: ConstExpr> "}" => Value::Const { expr: e, span: Span::DUMMY },
+};
+
+SuffixVal: Value = {
+    <a: AtomVal> => a,
+    <lo: @L> <a: AtomVal> "as" <t: Ty> <hi: @R> =>
+        Value::Cast { value: Box::new(a), ty: t, span: Span::new(lo as u32, hi as u32) },
+    <lo: @L> <a: AtomVal> "." <f: IdentSp> <hi: @R> =>
+        Value::Field { base: Box::new(a), name: f.v, span: Span::new(lo as u32, hi as u32) },
+};
+
+// `as`/`.` bind tighter than the wide-multiply form, and the multiply takes
+// bare atoms only — so `a * b as u32` is unambiguously `a * (b as u32)`.
+// (Spec §4.5 only ever writes `rdx:rax = rax * x;`.)
+Value: Value = {
+    <s: SuffixVal> => s,
+    <lo: @L> "&" <p: PlaceUntyped> <hi: @R> =>
+        Value::AddrOf { place: Box::new(p), span: Span::new(lo as u32, hi as u32) },
+    <lo: @L> <a: AtomVal> "*" <b: AtomVal> <hi: @R> =>
+        Value::Mul { lhs: Box::new(a), rhs: Box::new(b), span: Span::new(lo as u32, hi as u32) },
+};
+
+// ---------------------------------------------------------------------------
+// compile-time expressions (§8) — precedence chain
+// ---------------------------------------------------------------------------
+
+ConstExpr: ConstExpr = {
+    <lo: @L> <l: ConstExpr> "||" <r: CAnd> <hi: @R> => gram::bin(ConstBinOp::Or, l, r, lo, hi),
+    CAnd,
+};
+CAnd: ConstExpr = {
+    <lo: @L> <l: CAnd> "&&" <r: CEq> <hi: @R> => gram::bin(ConstBinOp::And, l, r, lo, hi),
+    CEq,
+};
+CEq: ConstExpr = {
+    <lo: @L> <l: CEq> <o: EqOp> <r: CCmp> <hi: @R> => gram::bin(o, l, r, lo, hi),
+    CCmp,
+};
+CCmp: ConstExpr = {
+    <lo: @L> <l: CCmp> <o: CmpOpKw> <r: COr> <hi: @R> => gram::bin(o, l, r, lo, hi),
+    COr,
+};
+COr: ConstExpr = {
+    <lo: @L> <l: COr> "|" <r: CXor> <hi: @R> => gram::bin(ConstBinOp::BitOr, l, r, lo, hi),
+    CXor,
+};
+CXor: ConstExpr = {
+    <lo: @L> <l: CXor> "^" <r: CAndB> <hi: @R> => gram::bin(ConstBinOp::BitXor, l, r, lo, hi),
+    CAndB,
+};
+CAndB: ConstExpr = {
+    <lo: @L> <l: CAndB> "&" <r: CShift> <hi: @R> => gram::bin(ConstBinOp::BitAnd, l, r, lo, hi),
+    CShift,
+};
+CShift: ConstExpr = {
+    <lo: @L> <l: CShift> "<<" <r: CAdd> <hi: @R> => gram::bin(ConstBinOp::Shl, l, r, lo, hi),
+    <lo: @L> <l: CShift> ">>" <r: CAdd> <hi: @R> => gram::bin(ConstBinOp::Shr, l, r, lo, hi),
+    CAdd,
+};
+CAdd: ConstExpr = {
+    <lo: @L> <l: CAdd> "+" <r: CMul> <hi: @R> => gram::bin(ConstBinOp::Add, l, r, lo, hi),
+    <lo: @L> <l: CAdd> "-" <r: CMul> <hi: @R> => gram::bin(ConstBinOp::Sub, l, r, lo, hi),
+    CMul,
+};
+CMul: ConstExpr = {
+    <lo: @L> <l: CMul> "*" <r: CUn> <hi: @R> => gram::bin(ConstBinOp::Mul, l, r, lo, hi),
+    <lo: @L> <l: CMul> "/" <r: CUn> <hi: @R> => gram::bin(ConstBinOp::Div, l, r, lo, hi),
+    <lo: @L> <l: CMul> "%" <r: CUn> <hi: @R> => gram::bin(ConstBinOp::Rem, l, r, lo, hi),
+    CUn,
+};
+CUn: ConstExpr = {
+    <lo: @L> "-" <e: CUn> <hi: @R> => gram::un(ConstUnOp::Neg, e, lo, hi),
+    <lo: @L> "!" <e: CUn> <hi: @R> => gram::un(ConstUnOp::Not, e, lo, hi),
+    CAtom,
+};
+CAtom: ConstExpr = {
+    <n: NumSp> => ConstExpr::Int { value: n, span: Span::DUMMY },
+    "true"  => ConstExpr::Bool { value: true, span: Span::DUMMY },
+    "false" => ConstExpr::Bool { value: false, span: Span::DUMMY },
+    <i: IdentSp> => ConstExpr::Name { name: i.v, span: i.span },
+    <lo: @L> <i: IdentSp> "(" <a: Comma0<ConstExpr>> ")" <hi: @R> =>
+        ConstExpr::Call { name: i.v, args: a, span: Span::new(lo as u32, hi as u32) },
+    <lo: @L> "[" <v: Comma1<ConstExpr>> "]" <hi: @R> =>
+        ConstExpr::Array { items: v, span: Span::new(lo as u32, hi as u32) },
+    <lo: @L> "[" <v: ConstExpr> ";" <c: ConstExpr> "]" <hi: @R> =>
+        ConstExpr::Repeat { value: Box::new(v), count: Box::new(c), span: Span::new(lo as u32, hi as u32) },
+    // tuple: 2+ elements; `(e)` stays the grouping form below — no conflict,
+    // the parser branches on `,` after the first element
+    <lo: @L> "(" <a: ConstExpr> "," <b: ConstExpr> <rest: ("," <ConstExpr>)*> ")" <hi: @R> => {
+        let mut v = vec![a, b];
+        v.extend(rest);
+        ConstExpr::Tuple { items: v, span: Span::new(lo as u32, hi as u32) }
+    },
+    <lo: @L> "if" <c: ConstExpr> <t: BlockLikeConst> "else" <e: BlockLikeConst> <hi: @R> =>
+        ConstExpr::If { cond: Box::new(c), then_b: Box::new(t), else_b: Box::new(e), span: Span::new(lo as u32, hi as u32) },
+    "(" <ConstExpr> ")",
+};
+
+// `if` bodies in const expressions are `{ expr }`
+BlockLikeConst: ConstExpr = {
+    "{" <e: ConstExpr> "}" => e,
+};
+
+EqOp: ConstBinOp = {
+    "==" => ConstBinOp::Eq,
+    "!=" => ConstBinOp::Ne,
+};
+CmpOpKw: ConstBinOp = {
+    "<"  => ConstBinOp::Lt,
+    "<=" => ConstBinOp::Le,
+    ">"  => ConstBinOp::Gt,
+    ">=" => ConstBinOp::Ge,
+};
+
+// ---------------------------------------------------------------------------
+// attributes (§1)
+// ---------------------------------------------------------------------------
+
+AttrArg: AttrArg = {
+    <i: IdentSp> => AttrArg::Ident(i.v),
+    <n: NumSp> => AttrArg::Int(n as i64),
+    <s: StrSp> => AttrArg::Str(String::from_utf8_lossy(&s).into_owned()),
+    <i: IdentSp> "=" <v: AttrArgVal> => AttrArg::Assign { name: i.v, value: Box::new(v) },
+};
+
+AttrArgVal: AttrArg = {
+    <i: IdentSp> => AttrArg::Ident(i.v),
+    <n: NumSp> => AttrArg::Int(n as i64),
+    <s: StrSp> => AttrArg::Str(String::from_utf8_lossy(&s).into_owned()),
+};
+
+Attr: Attr = {
+    "#[" <i: IdentSp> <args: AttrArgs> "]" => gram::attr(i, args),
+    // keyword-named attributes: #[syscall(1)], #[entry], #[global], #[align(16)]
+    "#[" <n: AttrKeyword> <args: AttrArgs> "]" => gram::attr(n, args),
+};
+
+AttrKeyword: Sp<String> = {
+    <lo: @L> "syscall" <hi: @R> => Sp { v: "syscall".into(), span: Span::new(lo as u32, hi as u32) },
+    <lo: @L> "align" <hi: @R> => Sp { v: "align".into(), span: Span::new(lo as u32, hi as u32) },
+    <lo: @L> "atomic" <hi: @R> => Sp { v: "atomic".into(), span: Span::new(lo as u32, hi as u32) },
+    <lo: @L> "volatile" <hi: @R> => Sp { v: "volatile".into(), span: Span::new(lo as u32, hi as u32) },
+};
+
+AttrArgs: Vec<AttrArg> = {
+    => vec![],
+    "(" <a: Comma0<AttrArg>> ")" => a,
+};
+
+Attrs: Vec<Attr> = Attr*;
+
+// ---------------------------------------------------------------------------
+// items (§5, §7, §8)
+// ---------------------------------------------------------------------------
+
+pub File: File = {
+    <items: Item*> => File { items },
+};
+
+Item: Item = {
+    <f: FnItem>     => gram::item_fn(f),
+    <e: ExternFn>   => gram::item_extern(e),
+    <c: ConstDecl>  => c,
+    <s: StaticBind> => gram::item_static(s),
+};
+
+// `const fn name(...) -> T { return expr; }` and `const NAME: T = expr;` share
+// the `const` prefix; branching right after `const` (fn keyword vs ident) and
+// after the name avoids LALR conflicts. The body shape is validated by the
+// grammar itself (const fn body = `return <const expr>;`).
+ConstDecl: Item = {
+    <lo: @L> "const" "fn" <i: IdentSp> "(" <params: Comma0<ConstParam>> ")" <ret: OptRetTy> "{" "return" <body: ConstExpr> ";" "}" <hi: @R> =>
+        gram::item_constfn(gram::const_fn_item(i, params, ret, body, Span::new(lo as u32, hi as u32))),
+    <lo: @L> "const" <i: IdentSp> ":" <t: Ty> "=" <v: ConstExpr> ";" <hi: @R> =>
+        gram::item_const(gram::const_item(i, t, v, lo, hi)),
+};
+
+Param: Param = {
+    <m: "mut"?> <i: IdentSp> "@" <p: PlaceTyped> => Param {
+        mutable: m.is_some(),
+        name: i.v.clone(),
+        place: p,
+        span: i.span,
+    },
+};
+
+RetSig: RetSig = {
+    => RetSig::None,
+    <lo: @L> "->" "!" <hi: @R> => gram::ret_never(Span::new(lo as u32, hi as u32)),
+    "->" <p: PlaceTyped> => gram::ret_single(p),
+    <lo: @L> "->" "(" <a: Param> "," <b: Param> <rest: ("," <Param>)*> ")" <hi: @R> => {
+        let mut parts = vec![a, b];
+        parts.extend(rest);
+        RetSig::Tuple { parts, span: Span::new(lo as u32, hi as u32) }
+    },
+};
+
+RegIdent: Reg = {
+    <i: IdentSp> =>? gram::reg_of(&i.v, i.span),
+};
+
+ClobbersOpt: Option<Clobbers> = {
+    => None,
+    <lo: @L> "clobbers" ":" <regs: Comma0<RegIdent>> <hi: @R> =>
+        Some(Clobbers { regs, span: Span::new(lo as u32, hi as u32) }),
+};
+
+FnItem: yana_ast::FnItem = {
+    <lo: @L> <attrs: Attrs> <p: "pub"?> "fn" <i: IdentSp> "(" <params: Comma0<Param>> ")" <ret: RetSig> <cl: ClobbersOpt> <body: Block> <hi: @R> =>
+        gram::fn_item(attrs, p.map(|_| Span::DUMMY), i, params, ret, cl, body, lo, hi),
+};
+
+ExternFn: yana_ast::ExternFnItem = {
+    <lo: @L> <attrs: Attrs> "extern" <abi: AbiStr?> "fn" <i: IdentSp> "(" <params: Comma0<Param>> ")" <ret: RetSig> <cl: ClobbersOpt> ";" <hi: @R> =>
+        gram::extern_fn_item(attrs, abi, i, params, ret, cl, lo, hi),
+};
+
+AbiStr: String = {
+    <s: StrSp> => String::from_utf8_lossy(&s).into_owned(),
+};
+
+ConstParam: (String, Ty) = {
+    <i: IdentSp> ":" <t: Ty> => (i.v, t),
+};
+
+OptRetTy: Option<Ty> = {
+    => None,
+    "->" <t: Ty> => Some(t),
+};
+
+StaticBind: yana_ast::StaticBind = {
+    <lo: @L> <attrs: Attrs> <p: "pub"?> "bind" <i: IdentSp> "@" <place: PlaceTyped> <init: StaticInit> ";" <hi: @R> =>
+        gram::static_bind(attrs, i, place, init, lo, hi),
+};
+
+StaticInit: Option<Value> = {
+    => None,
+    "=" <v: Value> => Some(v),
+};
+
+// ---------------------------------------------------------------------------
+// blocks and statements (§3–§6)
+// ---------------------------------------------------------------------------
+
+Block: Block = {
+    <lo: @L> "{" <stmts: Stmt*> "}" <hi: @R> => Block { stmts, span: Span::new(lo as u32, hi as u32) },
+};
+
+Stmt: Stmt = {
+    // bind [mut] name @ place [= init];
+    <lo: @L> "bind" <m: "mut"?> <i: IdentSp> "@" <p: PlaceTyped> <init: BindInit> ";" <hi: @R> =>
+        Stmt::Bind {
+            mutable: m.is_some(),
+            name: Some(i.v),
+            name_span: i.span,
+            place: p,
+            init,
+            pattern: None,
+            span: Span::new(lo as u32, hi as u32),
+        },
+    // destructuring bind: bind (q @ rax, r @ rdx) = value;
+    <lo: @L> "bind" "(" <a: Param> "," <b: Param> <rest: ("," <Param>)*> ")" "=" <v: Value> ";" <hi: @R> => {
+        let mut pattern = vec![a, b];
+        pattern.extend(rest);
+        Stmt::Bind {
+            mutable: false,
+            name: None,
+            name_span: Span::new(lo as u32, hi as u32),
+            place: Place::Discard { span: Span::DUMMY },
+            init: Some(v),
+            pattern: Some(pattern),
+            span: Span::new(lo as u32, hi as u32),
+        }
+    },
+    // alt dst <op>= src;
+    <lo: @L> "alt" <d: PlaceTyped> <op: AssignOpKw> <s: Value> ";" <hi: @R> =>
+        Stmt::Alt { dst: d, op, src: s, span: Span::new(lo as u32, hi as u32) },
+    // alt (rax, rdx) = pair /% d;   (§4.5)
+    <lo: @L> "alt" "(" <q: IdentSp> "," <r: IdentSp> ")" "=" <div: PlaceTyped> "/%" <d: Value> ";" <hi: @R> =>
+        Stmt::DivMod {
+            results: vec![gram::ident_place(&q.v, q.span), gram::ident_place(&r.v, r.span)],
+            dividend: div,
+            divisor: d,
+            span: Span::new(lo as u32, hi as u32),
+        },
+    // push/pop
+    <lo: @L> "push" "{" <i: Comma0<PlaceUntyped>> "}" ";" <hi: @R> =>
+        Stmt::Push { items: i, span: Span::new(lo as u32, hi as u32) },
+    <lo: @L> "pop" "{" <i: Comma0<PlaceUntyped>> "}" ";" <hi: @R> =>
+        Stmt::Pop { items: i, span: Span::new(lo as u32, hi as u32) },
+    // branch [ (cond) ] => 'label;
+    <lo: @L> "branch" <c: BranchCondOpt> "=>" <t: LblRef> ";" <hi: @R> =>
+        Stmt::Branch { cond: c, target: t.v, target_span: t.span, span: Span::new(lo as u32, hi as u32) },
+    // call — with or without result binding
+    <c: CallStmt> => c,
+    // return
+    <lo: @L> "return" <v: Value> ";" <hi: @R> =>
+        Stmt::Return { value: Some(v), span: Span::new(lo as u32, hi as u32) },
+    <lo: @L> "return" ";" <hi: @R> =>
+        Stmt::Return { value: None, span: Span::new(lo as u32, hi as u32) },
+    // raw syscall
+    <lo: @L> "syscall" ";" <hi: @R> => Stmt::Syscall { span: Span::new(lo as u32, hi as u32) },
+    // label (name) { ... }
+    <lo: @L> "label" "(" <i: IdentSp> ")" <body: Block> <hi: @R> =>
+        Stmt::Label { name: i.v, name_span: i.span, body, span: Span::new(lo as u32, hi as u32) },
+    // nested block
+    <b: Block> => Stmt::Nested(b),
+};
+
+LblRef: Sp<String> = {
+    <lo: @L> <s: "lbl"> <hi: @R> => Sp { v: s, span: Span::new(lo as u32, hi as u32) },
+};
+
+BindInit: Option<Value> = {
+    => None,
+    "=" <v: Value> => Some(v),
+};
+
+AssignOpKw: AssignOp = {
+    "="   => AssignOp::Assign,
+    "+="  => AssignOp::Add,
+    "-="  => AssignOp::Sub,
+    "*="  => AssignOp::Mul,
+    "^="  => AssignOp::Xor,
+    "&="  => AssignOp::And,
+    "|="  => AssignOp::Or,
+    "<<=" => AssignOp::Shl,
+    ">>=" => AssignOp::Shr,
+};
+
+BranchCondOpt: Option<BranchCond> = {
+    => None,
+    "(" <c: BranchCondInner> ")" => Some(c),
+};
+
+BranchCondInner: BranchCond = {
+    <lo: @L> <l: Value> <o: CmpTok> <r: Value> <hi: @R> =>
+        BranchCond::Cmp { lhs: l, op: o, rhs: r, span: Span::new(lo as u32, hi as u32) },
+    <lo: @L> <n: "!"?> <f: FlagTok> <hi: @R> =>
+        BranchCond::Flag { flag: f, negated: n.is_some(), span: Span::new(lo as u32, hi as u32) },
+};
+
+CmpTok: CmpOp = {
+    "==" => CmpOp::Eq,
+    "!=" => CmpOp::Ne,
+    "<"  => CmpOp::Lt,
+    "<=" => CmpOp::Le,
+    ">"  => CmpOp::Gt,
+    ">=" => CmpOp::Ge,
+};
+
+FlagTok: Flag = {
+    "zero"     => Flag::Zero,
+    "carry"    => Flag::Carry,
+    "negative" => Flag::Negative,
+    "overflow" => Flag::Overflow,
+    "even"     => Flag::Even,
+};
+
+CallStmt: Stmt = {
+    // call name [ { args } ];
+    <lo: @L> "call" <i: IdentSp> <args: CallArgs> ";" <hi: @R> =>
+        gram::call_stmt(None, i, args, lo, hi),
+    // bind r = call name { args };  /  bind _ = call ...
+    <lo: @L> "bind" <r: IdentSp> "=" "call" <i: IdentSp> <args: CallArgs> ";" <hi: @R> => {
+        let res = if r.v == "_" {
+            CallResults::Single { name: None, span: r.span }
+        } else {
+            CallResults::Single { name: Some(r.v), span: r.span }
+        };
+        gram::call_stmt(Some(res), i, args, lo, hi)
+    },
+    // bind (a, b) = call name { args };
+    <lo: @L> "bind" "(" <a: IdentSp> "," <b: IdentSp> <rest: ("," <IdentSp>)*> ")" "=" "call" <i: IdentSp> <args: CallArgs> ";" <hi: @R> => {
+        let mut names: Vec<Option<String>> = vec![
+            if a.v == "_" { None } else { Some(a.v) },
+            if b.v == "_" { None } else { Some(b.v) },
+        ];
+        for r in rest {
+            names.push(if r.v == "_" { None } else { Some(r.v) });
+        }
+        gram::call_stmt(Some(CallResults::Tuple { names, span: Span::new(lo as u32, hi as u32) }), i, args, lo, hi)
+    },
+};
+
+CallArgs: Vec<CallArg> = {
+    => vec![],
+    "{" <a: Comma0<CallArg>> "}" => a,
+};
+
+CallArg: CallArg = {
+    <lo: @L> <v: Value> <hi: @R> => gram::call_arg(None, v, None, lo, hi),
+    // named: `n: value` — value can carry an explicit `@ place` override (§5.3)
+    <lo: @L> <i: IdentSp> ":" <v: Value> <at: ArgAt> <hi: @R> =>
+        gram::call_arg(Some(i), v, at, lo, hi),
+    // bare explicit place: `value @ rdi`
+    <lo: @L> <v: Value> "@" <p: PlaceUntyped> <hi: @R> => gram::call_arg(None, v, Some(p), lo, hi),
+};
+
+ArgAt: Option<Place> = {
+    => None,
+    "@" <p: PlaceUntyped> => Some(p),
+};
+
+// ---------------------------------------------------------------------------
+// repetition helpers
+// ---------------------------------------------------------------------------
+
+Comma0<T>: Vec<T> = {
+    <v: (<T> ",")*> <e: T?> => match e {
+        None => v,
+        Some(e) => { let mut v = v; v.push(e); v }
+    },
+};
+Comma1<T>: Vec<T> = {
+    <v: (<T> ",")*> <e: T> => { let mut v = v; v.push(e); v },
+};

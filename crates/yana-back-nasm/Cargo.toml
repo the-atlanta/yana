@@ -1,0 +1,10 @@
+[package]
+name = "yana-back-nasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+yana-ast = { workspace = true }
+yana-codegen = { workspace = true }

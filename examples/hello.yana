@@ -1,0 +1,14 @@
+// hello.yana — рабочий пример из приложения к SPEC.md
+bind hello @ .rodata: [u8] = "Hello, YANA!\n";
+
+#[syscall(1)]
+extern fn write(fd @ rdi: u64, buf @ rsi: *u8, len @ rdx: u64) -> rax: i64;
+
+#[syscall(60)]
+extern fn exit(code @ rdi: u64) -> !;
+
+#[entry]
+fn main() -> ! {
+    call write { fd: 1, buf: &hello, len: hello.len };
+    call exit { code: 0 };
+}

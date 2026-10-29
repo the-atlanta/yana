@@ -1,0 +1,21 @@
+// factorial.yana — 5! через цикл, результат в stdout кодом возврата (120)
+
+#[syscall(60)]
+extern fn exit(code @ rdi: u64) -> !;
+
+#[entry]
+fn main() -> ! {
+    bind mut n @ rbx: u64 = 5;
+    bind mut acc @ rax: u64 = 1;
+    label (loop) {
+        branch (n == 0) => 'done;
+        alt acc *= n;
+        alt n -= 1;
+        branch => 'loop;
+    }
+    label (done) {
+        // acc = 120 → код возврата
+        alt rdi = acc;
+        call exit { code: rdi @ rdi };
+    }
+}

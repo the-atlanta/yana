@@ -1,0 +1,175 @@
+use iced_x86::*;
+use std::process::Command;
+
+fn main() {
+    let mut text: Vec<u8> = Vec::new();
+    let mut enc = Encoder::new(64);
+    let mut ip: u64 = 0;
+
+    // helper closure to encode + advance ip, returning the start offset of this insn
+    macro_rules! emit {
+        ($ins:expr) => {{
+            let i = $ins;
+            let start = ip;
+            let n = enc.encode(&i, ip).unwrap();
+            ip += n as u64;
+            start
+        }};
+    }
+
+    // mov rax, 1   (write syscall)
+    emit!(Instruction::with2(Code::Mov_rm64_imm32, Register::RAX, 1i64).unwrap());
+    // mov rdi, 1   (stdout)
+    emit!(Instruction::with2(Code::Mov_rm64_imm32, Register::RDI, 1i64).unwrap());
+
+    // lea rsi, [rip + msg]  -> encode with disp 0, record disp-field offset for reloc
+    // rip-rel MemoryOperand: base=RIP, index=None, scale=1, disp=0, disp_size=4
+    let rip_mem = MemoryOperand::new(Register::RIP, Register::None, 1, 0i64, 4, false, Register::None);
+    let lea = Instruction::with2(Code::Lea_r64_m, Register::RSI, rip_mem).unwrap();
+    let lea_start = emit!(lea);
+    // lea r64,[rip+disp32] = REX.W(48) 8D /r  modrm(mod=00,rm=101) disp32 -> 7 bytes
+    // disp field is the last 4 bytes
+    let disp_field_off = lea_start + 3;
+
+    // mov rdx, 13   (len)
+    emit!(Instruction::with2(Code::Mov_rm64_imm32, Register::RDX, 13i64).unwrap());
+    // syscall
+    let mut sys = Instruction::default(); sys.set_code(Code::Syscall);
+    emit!(sys);
+    // exit(0): mov rax,60 ; xor rdi,rdi ; syscall
+    emit!(Instruction::with2(Code::Mov_rm64_imm32, Register::RAX, 60i64).unwrap());
+    emit!(Instruction::with2(Code::Xor_rm64_r64, Register::RDI, Register::RDI).unwrap());
+    let mut sys2 = Instruction::default(); sys2.set_code(Code::Syscall);
+    emit!(sys2);
+
+    let text = enc.take_buffer();
+    let rodata = b"Hello, YANA!\n".to_vec(); // 13 bytes
+    let msg_len = rodata.len() as u64;
+
+    println!("[encode] text={} bytes, disp_field_off={}", text.len(), disp_field_off);
+    // disassemble to verify
+    let mut dec = Decoder::new(64, &text, DecoderOptions::NONE);
+    dec.set_ip(0);
+    let mut fmt = FastFormatter::new();
+    for d in dec {
+        let mut s = String::new();
+        fmt.format(&d, &mut s);
+        println!("   {:04x}: {}", d.ip(), s);
+    }
+
+    write_elf(&text, &rodata, disp_field_off as u32, msg_len);
+}
+
+fn write_elf(text: &[u8], rodata: &[u8], reloc_off: u32, msg_len: u64) {
+    const SHT_NULL: u32 = 0;
+    const SHT_PROGBITS: u32 = 1;
+    const SHT_SYMTAB: u32 = 2;
+    const SHT_STRTAB: u32 = 3;
+    const SHT_RELA: u32 = 4;
+    const SHF_ALLOC: u64 = 2;
+    const SHF_EXECINSTR: u64 = 4;
+    const STB_GLOBAL: u8 = 1 << 4;
+    const STT_FUNC: u8 = 2;
+    const STT_OBJECT: u8 = 1;
+    const R_X86_64_PC32: u32 = 2;
+
+    let mut shstrtab: Vec<u8> = Vec::new();
+    let sh_names = ["", ".text", ".rodata", ".rela.text", ".symtab", ".strtab", ".shstrtab"];
+    let mut sh_name_off = Vec::new();
+    for n in sh_names {
+        sh_name_off.push(shstrtab.len() as u32);
+        shstrtab.extend_from_slice(n.as_bytes());
+        shstrtab.push(0);
+    }
+
+    let mut strtab: Vec<u8> = vec![0];
+    let start_name_off = strtab.len() as u32; strtab.extend_from_slice(b"_start\0");
+    let msg_name_off = strtab.len() as u32; strtab.extend_from_slice(b"msg\0");
+
+    let mut symtab: Vec<u8> = vec![0; 24];
+    fn sym(name: u32, value: u64, size: u64, info: u8, shndx: u16) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&name.to_le_bytes());
+        v.push(info);
+        v.push(0);
+        v.extend_from_slice(&shndx.to_le_bytes());
+        v.extend_from_slice(&value.to_le_bytes());
+        v.extend_from_slice(&size.to_le_bytes());
+        v
+    }
+    symtab.extend(sym(start_name_off, 0, text.len() as u64, STB_GLOBAL | STT_FUNC, 1));
+    symtab.extend(sym(msg_name_off, 0, msg_len, STB_GLOBAL | STT_OBJECT, 2));
+
+    let mut rela: Vec<u8> = Vec::new();
+    rela.extend_from_slice(&(reloc_off as u64).to_le_bytes()); // r_offset: u64
+    let r_info: u64 = ((2u64) << 32) | (R_X86_64_PC32 as u64);
+    rela.extend_from_slice(&r_info.to_le_bytes());
+    let addend: i64 = -4;
+    rela.extend_from_slice(&addend.to_le_bytes());
+    debug_assert_eq!(rela.len(), 24);
+
+    let ehdr_size: u64 = 64;
+    let mut off = ehdr_size;
+    let text_off = off; off += text.len() as u64;
+    let rodata_off = off; off += rodata.len() as u64;
+    let rela_off = off; off += rela.len() as u64;
+    let symtab_off = off; off += symtab.len() as u64;
+    let strtab_off = off; off += strtab.len() as u64;
+    let shstrtab_off = off; off += shstrtab.len() as u64;
+    let shdr_off = off;
+
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&0x3eu16.to_le_bytes());
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&0u64.to_le_bytes());
+    out.extend_from_slice(&0u64.to_le_bytes());
+    out.extend_from_slice(&shdr_off.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&64u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&64u16.to_le_bytes());
+    out.extend_from_slice(&7u16.to_le_bytes());
+    out.extend_from_slice(&6u16.to_le_bytes());
+
+    out.extend_from_slice(text);
+    out.extend_from_slice(rodata);
+    out.extend_from_slice(&rela);
+    out.extend_from_slice(&symtab);
+    out.extend_from_slice(&strtab);
+    out.extend_from_slice(&shstrtab);
+
+    fn shdr(name: u32, ty: u32, flags: u64, addr: u64, off: u64, size: u64, link: u32, info: u32, align: u64, entsize: u64) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&name.to_le_bytes());
+        v.extend_from_slice(&ty.to_le_bytes());
+        v.extend_from_slice(&flags.to_le_bytes());
+        v.extend_from_slice(&addr.to_le_bytes());
+        v.extend_from_slice(&off.to_le_bytes());
+        v.extend_from_slice(&size.to_le_bytes());
+        v.extend_from_slice(&link.to_le_bytes());
+        v.extend_from_slice(&info.to_le_bytes());
+        v.extend_from_slice(&align.to_le_bytes());
+        v.extend_from_slice(&entsize.to_le_bytes());
+        v
+    }
+    out.extend(&shdr(0, SHT_NULL, 0, 0, 0, 0, 0, 0, 0, 0));
+    out.extend(&shdr(sh_name_off[1], SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, 0, text_off, text.len() as u64, 0, 0, 16, 0));
+    out.extend(&shdr(sh_name_off[2], SHT_PROGBITS, SHF_ALLOC, 0, rodata_off, rodata.len() as u64, 0, 0, 1, 0));
+    out.extend(&shdr(sh_name_off[3], SHT_RELA, 0, 0, rela_off, rela.len() as u64, 4, 1, 8, 24));
+    out.extend(&shdr(sh_name_off[4], SHT_SYMTAB, 0, 0, symtab_off, symtab.len() as u64, 5, 1, 8, 24));
+    out.extend(&shdr(sh_name_off[5], SHT_STRTAB, 0, 0, strtab_off, strtab.len() as u64, 0, 0, 1, 0));
+    out.extend(&shdr(sh_name_off[6], SHT_STRTAB, 0, 0, shstrtab_off, shstrtab.len() as u64, 0, 0, 1, 0));
+
+    std::fs::write("/tmp/yana-spike/hello.o", &out).unwrap();
+    println!("[elf] wrote hello.o ({} bytes)", out.len());
+
+    let st = Command::new("ld").args(["-o", "/tmp/yana-spike/hello", "/tmp/yana-spike/hello.o"]).status().unwrap();
+    println!("[ld] success={}", st.success());
+    if st.success() {
+        let r = Command::new("/tmp/yana-spike/hello").output().unwrap();
+        println!("[run] exit={:?} stdout={:?}", r.status.code(), String::from_utf8_lossy(&r.stdout));
+    }
+}

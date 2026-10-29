@@ -1,0 +1,92 @@
+//! Target description: what `usize` is, which syscalls exist, and how `#[entry]`
+//! maps to an OS symbol name (§13).
+
+use yana_ast::place::SectionKind;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arch {
+    X86_64,
+    // AArch64 / Xtensa come later (§13 🟡)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Os {
+    Linux,
+    Macos,
+}
+
+#[derive(Debug, Clone)]
+pub struct TargetInfo {
+    pub arch: Arch,
+    pub os: Os,
+}
+
+impl TargetInfo {
+    pub fn linux_x86_64() -> Self {
+        TargetInfo { arch: Arch::X86_64, os: Os::Linux }
+    }
+
+    /// `usize`/`isize` width in bits for this target.
+    pub fn usize_bits(&self) -> u32 {
+        match self.arch {
+            Arch::X86_64 => 64,
+        }
+    }
+
+    /// The symbol name the `#[entry]` function exports.
+    pub fn entry_symbol(&self) -> &'static str {
+        match (self.arch, self.os) {
+            (Arch::X86_64, Os::Linux) => "_start",
+            (Arch::X86_64, Os::Macos) => "_main",
+        }
+    }
+
+    /// Do exported symbols get a leading underscore? (macOS yes, Linux no)
+    pub fn symbol_prefix(&self) -> &'static str {
+        match self.os {
+            Os::Linux => "",
+            Os::Macos => "_",
+        }
+    }
+
+    /// Linker default: static ELF for Linux x86-64.
+    pub fn object_format(&self) -> &'static str {
+        match (self.arch, self.os) {
+            (Arch::X86_64, Os::Linux) => "elf64",
+            (Arch::X86_64, Os::Macos) => "macho64",
+        }
+    }
+
+    /// Sections present in an object file for this target, in link order.
+    pub fn sections(&self) -> &'static [SectionKind] {
+        match (self.arch, self.os) {
+            (Arch::X86_64, Os::Linux) => &[
+                SectionKind::Text,
+                SectionKind::RoData,
+                SectionKind::Data,
+                SectionKind::Bss,
+            ],
+            (Arch::X86_64, Os::Macos) => &[
+                SectionKind::Text,
+                SectionKind::RoData,
+                SectionKind::Data,
+                SectionKind::Bss,
+            ],
+        }
+    }
+}
+
+/// Resolver options (flags the CLI passes through).
+#[derive(Debug, Clone)]
+pub struct ResolveOptions {
+    /// `--strict`: `contract` warnings become errors (§11).
+    pub strict: bool,
+    /// Step budget for const evaluation (§8).
+    pub const_steps: u64,
+}
+
+impl Default for ResolveOptions {
+    fn default() -> Self {
+        ResolveOptions { strict: false, const_steps: 1_000_000 }
+    }
+}

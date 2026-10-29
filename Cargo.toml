@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/yana-ast",
+    "crates/yana-lexer",
+    "crates/yana-parser",
+    "crates/yana-codegen",
+    "crates/yana-back-iced",
+    "crates/yana-back-nasm",
+    "crates/yana-cli",
+    "crates/yana-lsp",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/the-atlanta/yana"
+
+[workspace.dependencies]
+yana-ast = { path = "crates/yana-ast" }
+yana-lexer = { path = "crates/yana-lexer" }
+yana-parser = { path = "crates/yana-parser" }
+yana-codegen = { path = "crates/yana-codegen" }
+yana-back-iced = { path = "crates/yana-back-iced" }
+yana-back-nasm = { path = "crates/yana-back-nasm" }
+
+logos = "0.16"
+lalrpop = "0.20"
+lalrpop-util = "0.20"
+iced-x86 = { version = "1.21", features = ["std"] }
+ariadne = "0.5"
+clap = { version = "4.5", features = ["derive"] }
+tower-lsp = "0.20"
+tokio = { version = "1", features = ["full"] }
+
+[profile.release]
+lto = "thin"
