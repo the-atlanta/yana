@@ -7,8 +7,9 @@
 //! ([`Token::BadNum`] etc.); the driver turns them into precise diagnostics.
 
 use yana_ast::{
-    Attr, AttrArg, AssignOp, Block, BranchCond, CallArg, CallResults, CmpOp, ConstBinOp,
-    ConstExpr, ConstUnOp, Clobbers, File, Flag, Item, Param, Place, RetSig, Span, Stmt, Ty, Value,
+    Attr, AttrArg, AssignOp, AltModifier, AtomicOrder, Block, BranchCond, CallArg, CallResults,
+    CmpOp, ConstBinOp, ConstExpr, ConstUnOp, Clobbers, File, Flag, Item, Param, Place, RetSig,
+    Span, Stmt, Ty, Value,
 };
 use yana_ast::place::{MemTerm, RawAddr};
 use yana_ast::reg::Reg;
@@ -239,6 +240,10 @@ PlaceTyped: Place = {
     <p: "pair"> ":" <t: Ty> => Place::RegPair { hi: p.0, lo: p.1, ty: Some(t), span: Span::new(p.2, p.3) },
     <a: RawAddr> => { let span = a.span; Place::Mem { addr: a, ty: None, span } },
     <a: RawAddr> ":" <t: Ty> => { let span = a.span; Place::Mem { addr: a, ty: Some(t), span } },
+    // §3 anonymous memory access notation: `@[rbx + rcx * 8 + 16]: u64` —
+    // the `@` is an optional marker, the place is the same `[addr]`.
+    "@" <a: RawAddr> => { let span = a.span; Place::Mem { addr: a, ty: None, span } },
+    "@" <a: RawAddr> ":" <t: Ty> => { let span = a.span; Place::Mem { addr: a, ty: Some(t), span } },
 };
 
 // ---------------------------------------------------------------------------
@@ -540,9 +545,15 @@ Stmt: Stmt = {
             span: Span::new(lo as u32, hi as u32),
         }
     },
-    // alt dst <op>= src;
+    // alt [modifier] dst <op>= src;
+    // §12 modifiers: `alt atomic(order)` / `alt volatile`; plain form keeps
+    // its own rule so LALR(1) can split on the token right after `alt`.
     <lo: @L> "alt" <d: PlaceTyped> <op: AssignOpKw> <s: Value> ";" <hi: @R> =>
-        Stmt::Alt { dst: d, op, src: s, span: Span::new(lo as u32, hi as u32) },
+        Stmt::Alt { dst: d, op, src: s, modifier: AltModifier::None, span: Span::new(lo as u32, hi as u32) },
+    <lo: @L> "alt" "volatile" <d: PlaceTyped> <op: AssignOpKw> <s: Value> ";" <hi: @R> =>
+        Stmt::Alt { dst: d, op, src: s, modifier: AltModifier::Volatile, span: Span::new(lo as u32, hi as u32) },
+    <lo: @L> "alt" "atomic" "(" <o: AtomicOrderName> ")" <d: PlaceTyped> <op: AssignOpKw> <s: Value> ";" <hi: @R> =>
+        Stmt::Alt { dst: d, op, src: s, modifier: AltModifier::Atomic(o), span: Span::new(lo as u32, hi as u32) },
     // alt (rax, rdx) = pair /% d;   (§4.5)
     <lo: @L> "alt" "(" <q: IdentSp> "," <r: IdentSp> ")" "=" <div: PlaceTyped> "/%" <d: Value> ";" <hi: @R> =>
         Stmt::DivMod {
@@ -597,6 +608,16 @@ AssignOpKw: AssignOp = {
     "|="  => AssignOp::Or,
     "<<=" => AssignOp::Shl,
     ">>=" => AssignOp::Shr,
+};
+
+// §12: `alt atomic(<order>)` — orders are NOT keywords; they parse as idents
+// with exact text, anything else → the `atomic-order` diagnostic via the
+// synthetic BadAtomicOrder token.
+AtomicOrderName: AtomicOrder = {
+    <i: IdentSp> =>? match AtomicOrder::parse(&i.v) {
+        Some(o) => Ok(o),
+        None => Err(gram::bad_atomic_order(&i.v, i.span)),
+    },
 };
 
 BranchCondOpt: Option<BranchCond> = {

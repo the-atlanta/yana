@@ -11,17 +11,17 @@ use std::collections::HashMap;
 use yana_ast::place::{MemTerm, RawAddr, SectionKind};
 use yana_ast::reg::Reg;
 use yana_ast::{
-    AssignOp, Block, BranchCond, CallArg, CallResults, DiagCode, Diagnostic, File, FnSig, Item,
-    Param, Place, RetSig, Span, Stmt, Ty, Value,
+    AltModifier, AssignOp, Block, BranchCond, CallArg, CallResults, DiagCode, Diagnostic, File,
+    FnSig, Item, Param, Place, RetSig, Span, Stmt, Ty, Value,
 };
 
 use crate::consteval::{self, ConstEnv, Value as CValue};
 use crate::insn;
 use crate::ir::{
-    BranchUse, CallContract, DataItem, Displacement, FnBody, Insn, Jcc, LabelDef, MemOp, Module,
-    Operand, SectionData, SpannedInsn, Symbol, SymbolKind, WideOp,
+    AtomicOp, BranchUse, CallContract, DataItem, Displacement, FnBody, Insn, Jcc, LabelDef, MemOp,
+    MemOrder, Module, Operand, SectionData, SpannedInsn, Symbol, SymbolKind, WideOp,
 };
-use crate::target::{ImportedDecl, ResolveOptions, TargetInfo};
+use crate::target::{Arch, ImportedDecl, ResolveOptions, TargetInfo};
 
 /// Result of resolving one module.
 pub struct ResolveOutput {
@@ -226,6 +226,12 @@ impl Resolver {
     fn err(&mut self, kind: &str, msg: impl Into<String>, span: Span) {
         self.diagnostics
             .push(Diagnostic::error(DiagCode::Semantic, kind, msg, span));
+    }
+
+    fn err_help(&mut self, kind: &str, msg: impl Into<String>, help: impl Into<String>, span: Span) {
+        self.diagnostics.push(
+            Diagnostic::error(DiagCode::Semantic, kind, msg, span).with_help(help),
+        );
     }
 
     fn warn(&mut self, code: DiagCode, kind: &str, msg: impl Into<String>, span: Span) {
@@ -758,7 +764,9 @@ impl Resolver {
                     self.lower_write(&operand, &ty_for_init, v, *span);
                 }
             }
-            Stmt::Alt { dst, op, src, span } => self.lower_alt(dst, *op, src, *span),
+            Stmt::Alt { dst, op, src, modifier, span } => {
+                self.lower_alt(dst, *op, src, modifier, *span)
+            }
             Stmt::DivMod { results, dividend, divisor, span } => {
                 self.lower_divmod(results, dividend, divisor, *span)
             }
@@ -877,7 +885,19 @@ impl Resolver {
     // alt / writes
     // ------------------------------------------------------------------
 
-    fn lower_alt(&mut self, dst: &Place, op: AssignOp, src: &Value, span: Span) {
+    fn lower_alt(&mut self, dst: &Place, op: AssignOp, src: &Value, modifier: &AltModifier, span: Span) {
+        // §12 modifiers take their own lowering path (the atomic path applies
+        // the mut/alt contract itself, and additionally admits static-bound
+        // names — those are anonymous memory, not bindings).
+        match modifier {
+            AltModifier::None => {}
+            AltModifier::Atomic(order) => {
+                return self.lower_atomic(dst, op, src, *order, span);
+            }
+            AltModifier::Volatile => {
+                return self.lower_volatile(dst, op, src, span);
+            }
+        }
         // `alt` targets: named bindings (must be mut), registers, memory.
         if let Place::Named { name, .. } = dst {
             match self.lookup(name) {
@@ -958,6 +978,154 @@ impl Resolver {
             AssignOp::Assign => unreachable!(),
         };
         self.emit(insn);
+    }
+
+    // ------------------------------------------------------------------
+    // §12: atomic / volatile
+    // ------------------------------------------------------------------
+
+    /// `alt atomic(order) dst <op>= src;` → one locked x86 instruction.
+    ///
+    /// Contracts (§12, binding decisions):
+    /// - dst MUST be memory: `@[...]` or a name bound to a static (anonymous
+    ///   memory). A register/pair destination is `atomic-register`.
+    /// - src MUST be a register or immediate; a memory source is
+    ///   `atomic-src-memory` (no hidden temporaries, §0).
+    /// - `=` (Exchange) needs a register source: `xchg` has no imm form →
+    ///   `atomic-assign-imm`.
+    /// - Non-x86-64 target: `unsupported-atomic-target` (owner 30.10).
+    fn lower_atomic(&mut self, dst: &Place, op: AssignOp, src: &Value, order: yana_ast::AtomicOrder, span: Span) {
+        use crate::target::Arch;
+        if self.target.arch != Arch::X86_64 {
+            self.err(
+                "unsupported-atomic-target",
+                "atomic(...) is not supported on this target (§15, решение 30.10)",
+                span,
+            );
+            return;
+        }
+        // mut/alt contract (§4.2): a bound name must be a mut binding; a
+        // static-bound name is anonymous memory and always writable.
+        if let Place::Named { name, .. } = dst {
+            if let Some(b) = self.lookup(name) {
+                if !b.mutable {
+                    self.err(
+                        "immutable-write",
+                        format!("cannot write to `{name}`: binding is not `mut` (§4.2)"),
+                        span,
+                    );
+                    return;
+                }
+            }
+        }
+        let aop = match op {
+            AssignOp::Assign => AtomicOp::Exchange,
+            AssignOp::Add => AtomicOp::Add,
+            AssignOp::Sub => AtomicOp::Sub,
+            AssignOp::And => AtomicOp::And,
+            AssignOp::Or => AtomicOp::Or,
+            AssignOp::Xor => AtomicOp::Xor,
+            _ => {
+                self.err(
+                    "atomic-op",
+                    format!("`{op:?}` has no one-instruction atomic form (§12: = + - & | ^ only)"),
+                    span,
+                );
+                return;
+            }
+        };
+        // dst must be memory: `@[...]`, or a name bound to a static (anonymous
+        // memory). Registers/pairs → atomic-register.
+        let dst_op = match self.resolve_place(dst) {
+            Some(o) => o,
+            None => return,
+        };
+        let dst_op = match dst_op {
+            Operand::Mem(m) => Operand::Mem(m),
+            // static-bound name: symbolic address → [sym] memory operand
+            Operand::Sym { sym, add } => Operand::Mem(MemOp {
+                base: None,
+                index: None,
+                scale: 1,
+                disp: Displacement::Sym { sym, add },
+                size: ty_bits(&self.place_ty(dst), &self.target) as u32,
+                rip_relative: true,
+            }),
+            _ => {
+                self.err(
+                    "atomic-register",
+                    "atomic target must be memory — x86 lock needs a memory operand (§12)",
+                    span,
+                );
+                return;
+            }
+        };
+        // src: register or immediate
+        let (src_op, _) = match self.resolve_value(src) {
+            Some(v) => v,
+            None => return,
+        };
+        match &src_op {
+            Operand::Mem(_) | Operand::Sym { .. } => {
+                self.err_help(
+                    "atomic-src-memory",
+                    "atomic source must be a register or immediate, not memory (§12)",
+                    "load it into a register first",
+                    span,
+                );
+                return;
+            }
+            Operand::Imm(_) if aop == AtomicOp::Exchange => {
+                self.err_help(
+                    "atomic-assign-imm",
+                    "atomic `=` lowers to `xchg` which needs a register source (§12)",
+                    "xchg needs a register source: bind the value first",
+                    span,
+                );
+                return;
+            }
+            _ => {}
+        }
+        let size = ty_bits(&self.place_ty(dst), &self.target) as u32;
+        let mo = match order {
+            yana_ast::AtomicOrder::Relaxed => MemOrder::Relaxed,
+            yana_ast::AtomicOrder::Acquire => MemOrder::Acquire,
+            yana_ast::AtomicOrder::Release => MemOrder::Release,
+            yana_ast::AtomicOrder::AcqRel => MemOrder::AcqRel,
+            yana_ast::AtomicOrder::SeqCst => MemOrder::SeqCst,
+        };
+        self.emit(Insn::AtomicRMW { op: aop, dst: dst_op, src: src_op, size, order: mo });
+    }
+
+    /// `alt volatile dst <op>= src;` → the normal one-instruction lowering,
+    /// wrapped in [`Insn::Volatile`] so no analysis may elide it.
+    fn lower_volatile(&mut self, dst: &Place, op: AssignOp, src: &Value, span: Span) {
+        // plain alt contract first: mut / known name
+        if let Place::Named { name, .. } = dst {
+            match self.lookup(name) {
+                Some(b) if !b.mutable => {
+                    self.err(
+                        "immutable-write",
+                        format!("cannot write to `{name}`: binding is not `mut` (§4.2)"),
+                        span,
+                    );
+                    return;
+                }
+                None => {
+                    self.err("unknown-name", format!("`{name}` is not bound here"), span);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // lower as a plain alt, then wrap whatever instruction it emitted
+        let before = self.body.insns.len();
+        self.lower_alt(dst, op, src, &AltModifier::None, span);
+        for si in &mut self.body.insns[before..] {
+            if !matches!(si.insn, Insn::Volatile(_)) {
+                si.insn = Insn::Volatile(Box::new(std::mem::replace(&mut si.insn, Insn::Nop)));
+            }
+        }
     }
 
     /// Emit the instruction(s) writing `src` into `dst` with `op`.

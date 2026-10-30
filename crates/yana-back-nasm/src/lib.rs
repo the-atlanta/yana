@@ -229,6 +229,48 @@ fn insn_to_nasm(ins: &Insn, module: &Module, labels: &HashMap<usize, String>) ->
         Insn::Ret => "ret".to_string(),
         Insn::Int3 => "int3".to_string(),
         Insn::Nop => "nop".to_string(),
+
+        // ---- §12: atomics / volatile ----
+        // `lock add qword [p], 1` — the size qualifier is REQUIRED when the
+        // operand is memory+imm (NASM can't infer the width otherwise);
+        // `xchg qword [p], rax` carries no lock prefix (xchg with memory is
+        // implicitly locked).
+        Insn::AtomicRMW { op, dst, src, size, .. } => {
+            use yana_codegen::AtomicOp;
+            let szq = size_qualifier(*size);
+            let mem = match dst {
+                Operand::Mem(m) => mem_str(m, module),
+                // resolve normalizes atomic dst to Mem already; Sym would be
+                // a pipeline bug — print it as-is so the error is visible.
+                other => operand_str(other, module, *size),
+            };
+            format!(
+                "{} {} {}, {}",
+                match op {
+                    AtomicOp::Exchange => "xchg",
+                    AtomicOp::Add => "lock add",
+                    AtomicOp::Sub => "lock sub",
+                    AtomicOp::And => "lock and",
+                    AtomicOp::Or => "lock or",
+                    AtomicOp::Xor => "lock xor",
+                },
+                szq,
+                mem,
+                operand_str(src, module, *size)
+            )
+        }
+        // §12 volatile: emit the inner text unchanged.
+        Insn::Volatile(inner) => insn_to_nasm(inner, module, labels),
+    }
+}
+
+/// Size qualifier for NASM memory operands (required for `lock add [p], 1`).
+fn size_qualifier(size: u32) -> &'static str {
+    match size {
+        64 => "qword",
+        32 => "dword",
+        16 => "word",
+        _ => "byte",
     }
 }
 

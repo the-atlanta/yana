@@ -1,0 +1,17 @@
+// atomics.yana — §12: три атомарных RMW над .data static, результат в exit code
+// 3 + 4 + 5 = 12
+
+#[syscall(60)]
+extern fn exit(code @ rdi: u64) -> !;
+
+bind counter @ .data: u64 = 0;
+
+#[entry]
+fn main() -> ! {
+    alt atomic(relaxed) @[counter]: u64 += 3;
+    alt atomic(relaxed) @[counter]: u64 += 4;
+    alt atomic(relaxed) @[counter]: u64 += 5;
+    alt rax = [counter]: u64;
+    alt rdi = rax;
+    call exit { code: rdi @ rdi };
+}

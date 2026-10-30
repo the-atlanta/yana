@@ -172,6 +172,10 @@ pub enum Token {
     /// the grammar fails with this token so the driver can emit a precise
     /// "use #[global]" diagnostic instead of a generic parse error.
     RemovedPub(BadLit),
+    /// Synthetic: `alt atomic(<name>)` with a name that is not one of the
+    /// five §12 memory orders — fails the fallible grammar action so the
+    /// driver can emit the precise `atomic-order` diagnostic.
+    BadAtomicOrder(BadLit),
 }
 
 /// Payload for synthetic error tokens (logos requires a single field).

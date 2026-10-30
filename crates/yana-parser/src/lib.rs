@@ -164,6 +164,13 @@ fn user_error_to_diag(tok: Token) -> Diagnostic {
             b.span(),
         )
         .with_help("Export symbols with the `#[global]` attribute (SPEC §15, решение 29.10)."),
+        Token::BadAtomicOrder(b) => Diagnostic::error(
+            DiagCode::Syntax,
+            "atomic-order",
+            format!("`{}` is not a memory order (§12)", b.text),
+            b.span(),
+        )
+        .with_help("Valid orders: relaxed, acquire, release, acqrel, seqcst."),
         other => Diagnostic::error(
             DiagCode::Syntax,
             "parse-error",

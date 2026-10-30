@@ -34,6 +34,7 @@ impl WithSpan for Token {
     fn span(&self) -> Span {
         match self {
             Token::BadNum(b) | Token::BadEscape(b) | Token::BadReg(b) => b.span(),
+            Token::RemovedPub(b) | Token::BadAtomicOrder(b) => b.span(),
             _ => Span::DUMMY,
         }
     }
@@ -153,10 +154,16 @@ pub fn fn_exported(attrs: &[Attr]) -> bool {
     attrs.iter().any(|a| a.has_name("global"))
 }
 
-/// Fallible action for the removed `pub` keyword: produces the synthetic
-/// [`Token::RemovedPub`] the driver turns into a precise diagnostic.
+/// `pub` was removed — fail with the synthetic RemovedPub token so the driver
+/// can emit a precise diagnostic.
 pub fn removed_pub(lo: usize, hi: usize) -> PErr {
     user_err(Token::RemovedPub(yana_lexer::token::BadLit::new("pub", lo as u32, hi as u32)))
+}
+
+/// `alt atomic(<name>)` with an unknown order name — fail with the synthetic
+/// BadAtomicOrder token so the driver can emit the `atomic-order` diagnostic.
+pub fn bad_atomic_order(name: &str, span: Span) -> PErr {
+    user_err(Token::BadAtomicOrder(yana_lexer::token::BadLit::new(name, span.lo, span.hi)))
 }
 
 /// Dummy param for single-value return signatures.
