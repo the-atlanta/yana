@@ -335,6 +335,7 @@ pub fn expand_ir(module: &Module) -> String {
                 format!("static {} @{offset} size={size}", section.name())
             }
             SymbolKind::Const { value } => format!("const {value}"),
+            SymbolKind::ExternStatic { size } => format!("extern-static size={size}"),
         };
         let exp = if sym.exported { " global" } else { "" };
         writeln!(out, "sym #{i} {} [{kind}{exp}]", sym.name).unwrap();

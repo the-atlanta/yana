@@ -150,7 +150,7 @@ bind buf @ .bss: [u8; 16];
     let file = parse_ok(src);
     assert_eq!(file.items.len(), 3);
     assert!(matches!(&file.items[0], Item::ConstFn(c) if c.name == "divmod" && c.params.len() == 2));
-    assert!(matches!(&file.items[1], Item::Const(c) if c.name == "LIMIT"));
+    assert!(matches!(&file.items[1], Item::Const(c) if c.name == "LIMIT" && c.attrs.is_empty()));
     match &file.items[2] {
         Item::Static(s) => {
             assert_eq!(s.name, "buf");
@@ -231,4 +231,65 @@ fn global_attribute_exports() {
         Item::Fn(f) => assert!(f.exported, "#[global] must set exported"),
         other => panic!("expected fn, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// `use path::name;` (§10 modules)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parses_use_item_single_segment_path() {
+    let src = "use math::divmod;\n";
+    let file = parse_ok(src);
+    assert_eq!(file.items.len(), 1);
+    match &file.items[0] {
+        Item::Use { path, .. } => {
+            let segs: Vec<&str> = path.iter().map(|(s, _)| s.as_str()).collect();
+            assert_eq!(segs, vec!["math", "divmod"], "{path:?}");
+        }
+        other => panic!("expected use, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_use_item_nested_path() {
+    let src = "use lib::math::divmod;\nuse single::thing;\n";
+    let file = parse_ok(src);
+    assert_eq!(file.items.len(), 2);
+    match &file.items[0] {
+        Item::Use { path, .. } => {
+            let segs: Vec<&str> = path.iter().map(|(s, _)| s.as_str()).collect();
+            assert_eq!(segs, vec!["lib", "math", "divmod"]);
+        }
+        other => panic!("expected use, got {other:?}"),
+    }
+    match &file.items[1] {
+        Item::Use { path, .. } => {
+            let segs: Vec<&str> = path.iter().map(|(s, _)| s.as_str()).collect();
+            assert_eq!(segs, vec!["single", "thing"]);
+        }
+        other => panic!("expected use, got {other:?}"),
+    }
+}
+
+#[test]
+fn use_span_covers_the_statement() {
+    let src = "use math::divmod;\n";
+    let file = parse_ok(src);
+    match &file.items[0] {
+        Item::Use { span, .. } => {
+            // "use math::divmod;" is 17 bytes: 0..17
+            assert_eq!((span.lo, span.hi), (0, 17), "{span:?}");
+        }
+        other => panic!("expected use, got {other:?}"),
+    }
+}
+
+#[test]
+fn use_may_mix_with_other_items() {
+    let src = "use math::divmod;\n#[global]\nfn f() -> ! { syscall; }\n";
+    let file = parse_ok(src);
+    assert_eq!(file.items.len(), 2);
+    assert!(matches!(&file.items[0], Item::Use { .. }));
+    assert!(matches!(&file.items[1], Item::Fn(_)));
 }

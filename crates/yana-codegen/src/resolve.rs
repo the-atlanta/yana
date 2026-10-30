@@ -21,7 +21,7 @@ use crate::ir::{
     BranchUse, CallContract, DataItem, Displacement, FnBody, Insn, Jcc, LabelDef, MemOp, Module,
     Operand, SectionData, SpannedInsn, Symbol, SymbolKind, WideOp,
 };
-use crate::target::{ResolveOptions, TargetInfo};
+use crate::target::{ImportedDecl, ResolveOptions, TargetInfo};
 
 /// Result of resolving one module.
 pub struct ResolveOutput {
@@ -71,6 +71,8 @@ struct Resolver {
     statics: HashMap<String, StaticInfo>,
     consts: HashMap<String, i128>,
     fns: HashMap<String, FnInfo>,
+    /// Names seeded by `use` imports (§10) — local declarations may not clash.
+    imported_names: Vec<String>,
 
     // current function state
     scopes: Vec<HashMap<String, Binding>>,
@@ -148,6 +150,7 @@ impl Resolver {
             opts,
             module: Module::default(),
             diagnostics: Vec::new(),
+            imported_names: Vec::new(),
         };
         r.env_consts_setup();
         r.module.target = r.target.clone();
@@ -156,6 +159,68 @@ impl Resolver {
 
     fn env_consts_setup(&mut self) {
         // nothing yet; consts filled during pass 1
+    }
+
+    /// Seed imported declarations (§10) into the symbol tables before the
+    /// file's own items are collected.
+    ///
+    /// Imported functions become extern-like symbols: undefined (resolved by
+    /// the linker at `ld` time), with ABI/clobbers taken from the imported
+    /// signature so call-site lowering and contracts behave exactly as for a
+    /// local `extern fn`. Imported consts fold to their value; imported
+    /// statics become undefined symbol references (Pc32 relocations). No
+    /// mangling (§10): the symbol name is the item name verbatim.
+    fn seed_imports(&mut self) {
+        let mut names: Vec<String> = Vec::new();
+        for decl in self.opts.imports.clone() {
+            let name = match &decl {
+                ImportedDecl::Fn { sig, .. } => sig.name.clone(),
+                ImportedDecl::Const { name, .. } => name.clone(),
+                ImportedDecl::Static { name, .. } => name.clone(),
+            };
+            names.push(name);
+            match decl {
+                ImportedDecl::Fn { sig, clobbers } => {
+                    self.collect_fn(&sig, true, false, None, true, clobbers, sig.span);
+                    if let Some(info) = self.fns.get_mut(&sig.name) {
+                        info.real_call = true;
+                    }
+                }
+                ImportedDecl::Const { name, value } => {
+                    let sym = self.module.symbols.len();
+                    self.module.symbols.push(Symbol {
+                        name: name.clone(),
+                        kind: SymbolKind::Const { value },
+                        exported: false,
+                        syscall: None,
+                        clobbers: vec![],
+                        span: Span::DUMMY,
+                    });
+                    self.consts.insert(name.clone(), value);
+                    self.env.consts.insert(name, CValue::Int(value));
+                    let _ = sym;
+                }
+                ImportedDecl::Static { name, size } => {
+                    // undefined symbol: SHN_UNDEF, STB_GLOBAL at write_object time
+                    let sym = self.module.symbols.len();
+                    self.module.symbols.push(Symbol {
+                        name: name.clone(),
+                        kind: SymbolKind::ExternStatic { size },
+                        exported: true,
+                        syscall: None,
+                        clobbers: vec![],
+                        span: Span::DUMMY,
+                    });
+                    self.statics.insert(
+                        name,
+                        StaticInfo { sym, section: SectionKind::Data, offset: 0, size },
+                    );
+                }
+            }
+        }
+        // only now that seeding is done: local declarations may not clash
+        // with imported names (checked in the collect_* functions)
+        self.imported_names = names;
     }
 
     fn err(&mut self, kind: &str, msg: impl Into<String>, span: Span) {
@@ -172,6 +237,7 @@ impl Resolver {
     // =====================================================================
 
     fn run(&mut self, file: &File) {
+        self.seed_imports();
         self.collect_decls(file);
         if self.diagnostics.iter().any(|d| matches!(d.level, yana_ast::DiagLevel::Error)) {
             return; // don't lower on a broken decl set
@@ -201,11 +267,27 @@ impl Resolver {
         // functions and externs → symbols
         for item in &file.items {
             match item {
-                Item::Fn(f) => self.collect_fn(&f.sig, f.exported, f.is_entry(), None, false, f.span),
+                Item::Fn(f) => self.collect_fn(
+                    &f.sig,
+                    f.exported,
+                    f.is_entry(),
+                    None,
+                    false,
+                    f.clobbers.as_ref().map(|c| c.regs.clone()).unwrap_or_default(),
+                    f.span,
+                ),
                 Item::ExternFn(e) => {
                     let syscall = e.syscall_number();
                     let real_call = e.abi.as_deref() == Some("C");
-                    self.collect_fn(&e.sig, true, false, syscall, true, e.span);
+                    self.collect_fn(
+                        &e.sig,
+                        true,
+                        false,
+                        syscall,
+                        true,
+                        e.clobbers.as_ref().map(|c| c.regs.clone()).unwrap_or_default(),
+                        e.span,
+                    );
                     if let Some(sym) = self.module.find(&e.sig.name) {
                         let info = self.fns.get_mut(&e.sig.name).unwrap();
                         info.real_call = real_call;
@@ -218,6 +300,14 @@ impl Resolver {
     }
 
     fn collect_static(&mut self, s: &yana_ast::StaticBind) {
+        if self.imported_names.contains(&s.name) {
+            self.err(
+                "duplicate-import",
+                format!("`{}` is both imported and declared here", s.name),
+                s.name_span,
+            );
+            return;
+        }
         let section = match &s.place {
             Place::Section { kind, .. } => *kind,
             _ => {
@@ -326,6 +416,14 @@ impl Resolver {
     }
 
     fn collect_const(&mut self, c: &yana_ast::ConstItem) {
+        if self.imported_names.contains(&c.name) {
+            self.err(
+                "duplicate-import",
+                format!("const `{}` is both imported and declared here", c.name),
+                c.name_span,
+            );
+            return;
+        }
         // value computed in eval_const (needs env); placeholder registered here
         let sym = self.module.symbols.len();
         self.module.symbols.push(Symbol {
@@ -385,10 +483,19 @@ impl Resolver {
         is_entry: bool,
         syscall: Option<i64>,
         is_extern: bool,
+        clobbers: Vec<Reg>,
         span: Span,
     ) {
         if self.fns.contains_key(&sig.name) || self.statics.contains_key(&sig.name) {
             self.err("dup-symbol", format!("symbol `{}` declared twice", sig.name), span);
+            return;
+        }
+        if self.imported_names.contains(&sig.name) {
+            self.err(
+                "duplicate-import",
+                format!("`{}` is both imported and declared here", sig.name),
+                sig.name_span,
+            );
             return;
         }
         let name = if is_entry {
@@ -441,7 +548,7 @@ impl Resolver {
             kind,
             exported: exported || is_entry || syscall.is_some(),
             syscall,
-            clobbers: if syscall.is_some() { vec![Reg::parse("rcx").unwrap(), Reg::parse("r11").unwrap()] } else { vec![] },
+            clobbers: if syscall.is_some() { vec![Reg::parse("rcx").unwrap(), Reg::parse("r11").unwrap()] } else { clobbers },
             span,
         });
 

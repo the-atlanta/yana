@@ -1,0 +1,7 @@
+// math.yana (next to this file) has no item named `nope`
+use math::nope;
+
+#[entry]
+fn main() -> ! {
+    syscall;
+}

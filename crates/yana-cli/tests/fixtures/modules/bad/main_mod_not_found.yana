@@ -1,0 +1,7 @@
+// no gone.yana anywhere
+use gone::thing;
+
+#[entry]
+fn main() -> ! {
+    syscall;
+}

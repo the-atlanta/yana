@@ -415,9 +415,21 @@ Item: Item = {
     <e: ExternFn>   => gram::item_extern(e),
     <c: ConstDecl>  => c,
     <s: StaticBind> => gram::item_static(s),
+    <u: UseItem>    => u,
     // `pub` was removed from the language (SPEC §15, решение 29.10) —
     // fail with a precise diagnostic instead of a generic parse error.
     <lo: @L> "pub" <hi: @R> =>? Err(gram::removed_pub(lo, hi)),
+};
+
+// `use path::name;` (§10) — the path segments are identifiers separated by
+// `::`. Resolution (module file + item name) happens in the module loader.
+UseItem: Item = {
+    <lo: @L> "use" <p: UsePath> ";" <hi: @R> => gram::item_use(p, lo, hi),
+};
+
+UsePath: Vec<gram::Sp<String>> = {
+    <i: IdentSp> => vec![i],
+    <mut p: UsePath> "::" <i: IdentSp> => { p.push(i); p },
 };
 
 // `const fn name(...) -> T { return expr; }` and `const NAME: T = expr;` share
@@ -425,10 +437,10 @@ Item: Item = {
 // after the name avoids LALR conflicts. The body shape is validated by the
 // grammar itself (const fn body = `return <const expr>;`).
 ConstDecl: Item = {
-    <lo: @L> "const" "fn" <i: IdentSp> "(" <params: Comma0<ConstParam>> ")" <ret: OptRetTy> "{" "return" <body: ConstExpr> ";" "}" <hi: @R> =>
-        gram::item_constfn(gram::const_fn_item(i, params, ret, body, Span::new(lo as u32, hi as u32))),
-    <lo: @L> "const" <i: IdentSp> ":" <t: Ty> "=" <v: ConstExpr> ";" <hi: @R> =>
-        gram::item_const(gram::const_item(i, t, v, lo, hi)),
+    <lo: @L> <attrs: Attrs> "const" "fn" <i: IdentSp> "(" <params: Comma0<ConstParam>> ")" <ret: OptRetTy> "{" "return" <body: ConstExpr> ";" "}" <hi: @R> =>
+        gram::item_constfn(gram::const_fn_item(attrs, i, params, ret, body, Span::new(lo as u32, hi as u32))),
+    <lo: @L> <attrs: Attrs> "const" <i: IdentSp> ":" <t: Ty> "=" <v: ConstExpr> ";" <hi: @R> =>
+        gram::item_const(gram::const_item(attrs, i, t, v, lo, hi)),
 };
 
 Param: Param = {

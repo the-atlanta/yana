@@ -1,0 +1,22 @@
+// main.yana — imports from math.yana (SPEC §10).
+//
+// `use math::add10` → file math.yana next to this file, item add10.
+// `use math::BASE`   → the #[global] const's VALUE folds into this module.
+//
+// Exit code: (7 + 10 + BASE + 52) mod 256 = 45.
+
+#[syscall(60)]
+extern fn exit(code @ rdi: u64) -> !;
+
+use math::add10;
+use math::BASE;
+
+#[entry]
+fn main() -> ! {
+    // the imported signature says the result lands in rax
+    bind r = call add10 { n: 7 };
+    alt rdi = r;
+    alt rdi += BASE;
+    alt rdi += 52;
+    call exit { code: rdi @ rdi };
+}

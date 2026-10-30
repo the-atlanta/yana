@@ -114,10 +114,14 @@ pub fn link_exe(module: &Module) -> Result<Vec<u8>, crate::encode::AsmError> {
                 let info = ((if global { STB_GLOBAL } else { STB_LOCAL }) << 4) | STT_OBJECT;
                 symtab.extend(sym_entry(name_off, vaddr, *size, info, shndx));
             }
-            SymbolKind::Const { .. } | SymbolKind::ExternFn => {
+            SymbolKind::Const { .. } | SymbolKind::ExternFn | SymbolKind::ExternStatic { .. } => {
                 // consts have no runtime symbol; externs are undefined (SHN_UNDEF=0)
                 if matches!(s.kind, SymbolKind::ExternFn) {
                     let info = (STB_GLOBAL << 4) | STT_FUNC;
+                    symtab.extend(sym_entry(name_off, 0, 0, info, 0));
+                }
+                if matches!(s.kind, SymbolKind::ExternStatic { .. }) {
+                    let info = (STB_GLOBAL << 4) | STT_OBJECT;
                     symtab.extend(sym_entry(name_off, 0, 0, info, 0));
                 }
             }
@@ -332,8 +336,20 @@ fn phdr(
 }
 
 /// Write a relocatable `ET_REL` object (`.o`) — used for the NASM-oracle
-/// comparison (`ld` both objects, disassemble, compare). Symbol references that
-/// could not be resolved at encode time become `.rela.text` entries.
+/// comparison and as the per-module output of the multi-module build (§10:
+/// one object file per source file, linked by the system `ld`).
+///
+/// Symbol table rules (§10):
+/// - defined `#[global]` symbols → `STB_GLOBAL`;
+/// - defined non-exported symbols → `STB_LOCAL` (GNU ld requires all locals
+///   before all globals, so symbols are emitted locals-first);
+/// - undefined imports (`extern fn` and imported statics) → `STB_GLOBAL`
+///   with `SHN_UNDEF`;
+/// - `#[syscall(N)]` externs lower inline (`mov rax,N; syscall`) and never
+///   become symbols; `const` has no runtime presence and is skipped.
+///
+/// `.rela.text` entries are 24 bytes each: `r_offset` u64, `r_info` u64,
+/// `r_addend` i64 (a past bug wrote a u32 r_offset — do not regress).
 pub fn write_object(module: &Module, enc: &EncodedText) -> Result<Vec<u8>, crate::encode::AsmError> {
     // Reuse the proven spike format: symtab + .rela.text from enc.patches.
     let mut shstrtab: Vec<u8> = Vec::new();
@@ -360,26 +376,39 @@ pub fn write_object(module: &Module, enc: &EncodedText) -> Result<Vec<u8>, crate
         symtab.extend(sym_entry(off, 0, 0, info, shndx));
         n_local += 1;
     }
-    // map module symbol index → ELF symtab index
+
+    // Symbols that materialize in the object. Skip #[syscall(N)] externs
+    // (inline lowering, never a linker symbol) and consts (no runtime
+    // presence). Locals first, then globals (GNU ld hard-requires it).
+    let emitted: Vec<usize> = (0..module.symbols.len())
+        .filter(|&i| {
+            let s = &module.symbols[i];
+            !(matches!(s.kind, SymbolKind::ExternFn) && s.syscall.is_some())
+                && !matches!(s.kind, SymbolKind::Const { .. })
+        })
+        .collect();    // module symbol index → ELF symtab index
     let mut elf_index: HashMap<usize, u32> = HashMap::new();
     let mut next_idx = 5u32;
-    for (i, s) in module.symbols.iter().enumerate() {
+    let mut emit_symbol = |i: usize| {
+        let s = &module.symbols[i];
         let off = intern(&mut strtab, &s.name);
         let (info, shndx, size) = match &s.kind {
             SymbolKind::Function { .. } => {
                 (((if s.exported { STB_GLOBAL } else { STB_LOCAL }) << 4) | STT_FUNC, 1u16, 0u64)
             }
-            SymbolKind::Static { section, .. } => {
+            SymbolKind::Static { section, size, .. } => {
                 let sh = match section {
                     SectionKind::Text => 1,
                     SectionKind::RoData => 2,
                     SectionKind::Data => 3,
                     SectionKind::Bss => 4,
                 };
-                (((if s.exported { STB_GLOBAL } else { STB_LOCAL }) << 4) | STT_OBJECT, sh, 0u64)
+                (((if s.exported { STB_GLOBAL } else { STB_LOCAL }) << 4) | STT_OBJECT, sh, *size)
             }
-            SymbolKind::ExternFn => (((STB_GLOBAL) << 4) | STT_FUNC, 0u16, 0u64),
-            SymbolKind::Const { .. } => (((STB_LOCAL) << 4) | STT_OBJECT, 0u16, 0u64),
+            // undefined symbols (extern fn, imported static): STB_GLOBAL, SHN_UNDEF
+            SymbolKind::ExternFn => ((STB_GLOBAL << 4) | STT_FUNC, 0u16, 0u64),
+            SymbolKind::ExternStatic { .. } => ((STB_GLOBAL << 4) | STT_OBJECT, 0u16, 0u64),
+            SymbolKind::Const { .. } => unreachable!("consts are filtered out above"),
         };
         let value = match &s.kind {
             SymbolKind::Function { .. } => enc.fn_offsets.get(&i).copied().unwrap_or(0),
@@ -390,6 +419,14 @@ pub fn write_object(module: &Module, enc: &EncodedText) -> Result<Vec<u8>, crate
             n_local += 1;
         }
         symtab.extend(sym_entry(off, value, size, info, shndx));
+    };
+    for &i in emitted.iter().filter(|&&i| !module.symbols[i].exported) {
+        emit_symbol(i);
+        elf_index.insert(i, next_idx);
+        next_idx += 1;
+    }
+    for &i in emitted.iter().filter(|&&i| module.symbols[i].exported) {
+        emit_symbol(i);
         elf_index.insert(i, next_idx);
         next_idx += 1;
     }
@@ -405,6 +442,7 @@ pub fn write_object(module: &Module, enc: &EncodedText) -> Result<Vec<u8>, crate
             crate::encode::RelocKind::Pc32 => R_X86_64_PC32,
             crate::encode::RelocKind::Abs32 | crate::encode::RelocKind::Abs64 => R_X86_64_PC32,
         };
+        // 24-byte Elf64_Rela: r_offset u64, r_info u64, r_addend i64
         rela.extend_from_slice(&(p.at as u64).to_le_bytes());
         let r_info = ((sym as u64) << 32) | (rtype as u64);
         rela.extend_from_slice(&r_info.to_le_bytes());

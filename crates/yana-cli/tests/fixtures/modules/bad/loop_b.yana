@@ -1,0 +1,6 @@
+use loop_a::f;
+
+#[global]
+fn f() {
+    return;
+}

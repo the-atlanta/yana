@@ -5,3 +5,4 @@ Cargo.lock
 /examples/out
 zed-extension/target
 zed-extension/grammars/yana/node_modules
+*.exe

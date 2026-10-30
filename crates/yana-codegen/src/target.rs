@@ -1,6 +1,8 @@
 //! Target description: what `usize` is, which syscalls exist, and how `#[entry]`
 //! maps to an OS symbol name (§13).
 
+use yana_ast::reg::Reg;
+use yana_ast::{FnSig};
 use yana_ast::place::SectionKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,10 +101,32 @@ pub struct ResolveOptions {
     pub strict: bool,
     /// Step budget for const evaluation (§8).
     pub const_steps: u64,
+    /// Declarations imported via `use path::name;` (§10) — seeded into the
+    /// symbol tables before the file's own items are collected. The module
+    /// loader (CLI) extracts these from the referenced module files.
+    pub imports: Vec<ImportedDecl>,
 }
 
 impl Default for ResolveOptions {
     fn default() -> Self {
-        ResolveOptions { strict: false, const_steps: 1_000_000 }
+        ResolveOptions { strict: false, const_steps: 1_000_000, imports: Vec::new() }
     }
+}
+
+/// One declaration extracted from a used module (§10).
+///
+/// Export visibility (`#[global]`) was already checked by the loader, so every
+/// entry here is importable. No name mangling anywhere (§10): the symbol name
+/// is the item name verbatim.
+#[derive(Debug, Clone)]
+pub enum ImportedDecl {
+    /// A function (or extern fn) — imported as an undefined, linkable symbol.
+    /// The full signature is kept so call-site lowering (movs into ABI places,
+    /// results, contract) works exactly as for a local extern.
+    Fn { sig: FnSig, clobbers: Vec<Reg> },
+    /// A build-time constant — its value, usable in const expressions.
+    Const { name: String, value: i128 },
+    /// Static data — an undefined symbol reference usable in places/`lea`
+    /// (Pc32 relocation); `size` feeds `name.len`.
+    Static { name: String, size: u64 },
 }
