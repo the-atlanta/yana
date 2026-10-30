@@ -23,8 +23,8 @@ use std::collections::HashMap;
 use yana_ast::place::SectionKind;
 use yana_ast::reg::{GprBase, Reg, RegSize};
 use yana_codegen::{
-    DataItem, Displacement, FnBody, Insn, Jcc, MemOp, Module, Operand, SectionData, SymbolKind,
-    WideOp,
+    AtomicOp, DataItem, Displacement, FnBody, Insn, Jcc, MemOp, Module, Operand, SectionData,
+    SymbolKind, WideOp,
 };
 
 // ---------------------------------------------------------------------------
@@ -265,8 +265,12 @@ pub fn assemble_text(module: &Module, layout: Option<Layout>) -> Result<EncodedT
             // rip-relative memory with symbol disp: disp32 sits before any
             // immediate; for the MVP instruction set (mov/add/... with Sym
             // disp) disp32 is also the last 4 bytes when there is no imm.
-            if let Insn::Mov { src: Operand::Mem(m), .. } | Insn::Add { src: Operand::Mem(m), .. }
-                | Insn::Sub { src: Operand::Mem(m), .. } | Insn::Cmp { b: Operand::Mem(m), .. } = &ins.insn
+            // §12 atomics with an immediate source are the exception: the
+            // imm8/imm32 field trails the disp32, so skip it.
+            if let Insn::Mov { src: Operand::Mem(m), .. }
+                | Insn::Add { src: Operand::Mem(m), .. }
+                | Insn::Sub { src: Operand::Mem(m), .. }
+                | Insn::Cmp { b: Operand::Mem(m), .. } = &ins.insn
             {
                 if let Displacement::Sym { sym, add } = &m.disp {
                     if m.index.is_none() {
@@ -284,6 +288,33 @@ pub fn assemble_text(module: &Module, layout: Option<Layout>) -> Result<EncodedT
                         } else {
                             return Err(AsmError::Unresolved(format!(
                                 "memory reference to undefined symbol `{}`",
+                                module.symbols[*sym].name
+                            )));
+                        }
+                    }
+                }
+            }
+            // §12: atomic RMW with a symbolic destination — same fixup, but
+            // the displacement is followed by a trailing immediate field
+            // whose width depends on the chosen encoding.
+            if let Insn::AtomicRMW { dst: Operand::Mem(m), src, size, .. } = &ins.insn {
+                if let Displacement::Sym { sym, add } = &m.disp {
+                    if m.index.is_none() {
+                        let tail = atomic_trailing_imm(src, *size);
+                        let field_off = text.len() + n - 4 - tail;
+                        if let Some(v) = sym_vaddrs.get(sym).copied().flatten() {
+                            fixups.push((field_off, Fixup::Rip32 { target: v as i64 + *add, next_ip: ip + n as u64 }));
+                        } else if layout.is_none() {
+                            patches.push(PatchSite {
+                                at: field_off,
+                                width: 4,
+                                kind: RelocKind::Pc32,
+                                sym: *sym,
+                                addend: *add - 4 - tail as i64,
+                            });
+                        } else {
+                            return Err(AsmError::Unresolved(format!(
+                                "atomic memory reference to undefined symbol `{}`",
                                 module.symbols[*sym].name
                             )));
                         }
@@ -313,6 +344,27 @@ pub fn assemble_text(module: &Module, layout: Option<Layout>) -> Result<EncodedT
 fn text_end_at(fn_starts: &HashMap<usize, u64>, _body: &FnBody, text_end: u64) -> u64 {
     let _ = fn_starts;
     text_end
+}
+
+/// Number of trailing immediate bytes an atomic RMW instruction carries,
+/// mirroring the encoding chosen in [`build_insn_inner`] (§12). The rip-disp
+/// fixup needs this: the disp32 field sits BEFORE the immediate, not at the
+/// end of the instruction.
+fn atomic_trailing_imm(src: &Operand, size: u32) -> usize {
+    match src {
+        Operand::Reg(_) => 0,
+        Operand::Imm(v) => {
+            let fits_i8 = *v >= i8::MIN as i64 && *v <= i8::MAX as i64;
+            // alu_imm8_code covers 64/32-bit only; 16-bit falls back to imm16,
+            // 8-bit operands always use imm8.
+            match size {
+                64 | 32 => if fits_i8 { 1 } else { 4 },
+                16 => 2,
+                _ => 1,
+            }
+        }
+        _ => 0, // Mem/Sym sources are rejected by resolve before encoding
+    }
 }
 
 fn label_index(body: &FnBody, name: &str) -> usize {
@@ -547,6 +599,73 @@ fn build_insn_inner(
         Insn::Ret => zero_op(Code::Retnq),
         Insn::Int3 => zero_op(Code::Int3),
         Insn::Nop => zero_op(Code::Nopd),
+
+        // ---- §12: atomic / volatile ----
+        // One statement = one instruction: a locked RMW, or xchg with memory
+        // (implicitly locked — no redundant F0 prefix is emitted). All
+        // orders encode identically on x86-64 (lock RMW = full barrier); the
+        // order lives in the IR for future targets.
+        Insn::AtomicRMW { op: aop_kind, dst, src, size, .. } => {
+            let d = op(dst)?;
+            let s = op(src)?;
+            let mut i = match aop_kind {
+                AtomicOp::Exchange => {
+                    // xchg [m], r — register source guaranteed by resolve
+                    let code = xchg_code(*size)?;
+                    match (d, s) {
+                        (IcedOp::Mem(m), IcedOp::Reg(r)) => {
+                            Instruction::with2(code, m, r).map_err(enc_err)?
+                        }
+                        _ => {
+                            return Err(AsmError::Encode(
+                                "atomic xchg: resolver must guarantee [mem], reg".into(),
+                            ))
+                        }
+                    }
+                }
+                AtomicOp::Add | AtomicOp::Sub | AtomicOp::And | AtomicOp::Or | AtomicOp::Xor => {
+                    let ar = match aop_kind {
+                        AtomicOp::Add => Arith::Add,
+                        AtomicOp::Sub => Arith::Sub,
+                        AtomicOp::And => Arith::And,
+                        AtomicOp::Or => Arith::Or,
+                        AtomicOp::Xor => Arith::Xor,
+                        AtomicOp::Exchange => unreachable!(),
+                    };
+                    // memory dst, reg/imm src: reuse the plain RMW builder and
+                    // add the lock prefix on top.
+                    match (d, s) {
+                        (IcedOp::Mem(_), IcedOp::Reg(_)) => {
+                            arith(dst, src, *size, ar, &op)?
+                        }
+                        (IcedOp::Mem(m), IcedOp::Imm(v)) => {
+                            // imm8 form when it fits (F0 48 83 00 01), else
+                            // the plain imm32/imm8-size table
+                            let code = if v >= i8::MIN as i64 && v <= i8::MAX as i64 {
+                                match alu_imm8_code(*size, &ar) {
+                                    Ok(c) => c,
+                                    Err(_) => alu_rm_imm(*size, &ar)?,
+                                }
+                            } else {
+                                alu_rm_imm(*size, &ar)?
+                            };
+                            Instruction::with2(code, m, v as u32).map_err(enc_err)?
+                        }
+                        _ => {
+                            return Err(AsmError::Encode(
+                                "atomic rmw: resolver must guarantee [mem], reg|imm".into(),
+                            ))
+                        }
+                    }
+                }
+            };
+            if *aop_kind != AtomicOp::Exchange {
+                i.set_has_lock_prefix(true);
+            }
+            Ok(i)
+        }
+        // §12 volatile: encode the inner instruction unchanged.
+        Insn::Volatile(inner) => build_insn_inner(inner, sym_vaddrs, layout, base),
     }
 }
 
@@ -754,6 +873,19 @@ fn alu_rm_imm(size: u32, a: &Arith) -> Result<Code, AsmError> {
         (Arith::Xor, 64) => Code::Xor_rm64_imm32, (Arith::Xor, 32) => Code::Xor_rm32_imm32,
         (Arith::Xor, 16) => Code::Xor_rm16_imm16, (Arith::Xor, 8) => Code::Xor_rm8_imm8,
         _ => return Err(AsmError::Encode("alu imm: bad size".into())),
+    })
+}
+/// imm8-encoded ALU forms (`F0 48 83 00 01` = lock add qword [rax],1): only
+/// used when the immediate fits in a signed byte — otherwise the plain imm
+/// table applies. Note iced has no imm8 variant for 16-bit operands.
+fn alu_imm8_code(size: u32, a: &Arith) -> Result<Code, AsmError> {
+    Ok(match (a, size) {
+        (Arith::Add, 64) => Code::Add_rm64_imm8, (Arith::Add, 32) => Code::Add_rm32_imm8,
+        (Arith::Sub, 64) => Code::Sub_rm64_imm8, (Arith::Sub, 32) => Code::Sub_rm32_imm8,
+        (Arith::And, 64) => Code::And_rm64_imm8, (Arith::And, 32) => Code::And_rm32_imm8,
+        (Arith::Or, 64) => Code::Or_rm64_imm8, (Arith::Or, 32) => Code::Or_rm32_imm8,
+        (Arith::Xor, 64) => Code::Xor_rm64_imm8, (Arith::Xor, 32) => Code::Xor_rm32_imm8,
+        _ => return Err(AsmError::Encode("alu imm8: bad size (no imm8 form for 8/16-bit)".into())),
     })
 }
 fn cmp_rm_r(size: u32) -> Result<Code, AsmError> {
@@ -981,4 +1113,74 @@ pub fn disassemble(bytes: &[u8], ip: u64) -> Vec<String> {
         out.push(format!("{:08x}  {}", i.ip(), s));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    //! §12 atomics: byte-exact encodings through the full resolve pipeline.
+
+    use super::*;
+    use yana_codegen::{resolve_module, ResolveOptions, TargetInfo};
+
+    fn encode_one(src: &str) -> Vec<u8> {
+        let parsed = yana_parser::parse(src);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let out = resolve_module(
+            parsed.file.as_ref().unwrap(),
+            &TargetInfo::linux_x86_64(),
+            &ResolveOptions::default(),
+        );
+        assert!(
+            !out.diagnostics.iter().any(|d| matches!(d.level, yana_ast::DiagLevel::Error)),
+            "{:?}",
+            out.diagnostics
+        );
+        let module = out.module;
+        let body = &module.bodies[0];
+        let mut text = Vec::new();
+        let mut enc = Encoder::new(64);
+        for si in &body.insns {
+            // stop before the function's trailing `ret`
+            if matches!(si.insn, Insn::Ret) {
+                break;
+            }
+            if let Some(ins) = build_insn(&si.insn, &HashMap::new(), None, 0).expect("build") {
+                let n = enc.encode(&ins, 0).expect("encode");
+                text.extend_from_slice(&enc.take_buffer()[..n]);
+            }
+        }
+        text
+    }
+
+    /// `alt atomic(seqcst) @[rax]: u64 += 1;` → `lock add qword [rax],1`
+    /// = F0 48 83 00 01.
+    #[test]
+    fn atomic_add_reg_addr_imm1_bytes() {
+        let text = encode_one(
+            "fn f() { alt atomic(seqcst) @[rax]: u64 += 1; return; }",
+        );
+        assert_eq!(text, vec![0xF0, 0x48, 0x83, 0x00, 0x01], "lock add qword [rax],1");
+        let dis = disassemble(&text, 0).join("\n");
+        assert!(dis.contains("lock add qword ptr [rax],1"), "{dis}");
+    }
+
+    /// Atomic `=` → `xchg [m], r` with NO lock prefix (implicitly locked).
+    #[test]
+    fn atomic_exchange_no_lock_prefix() {
+        let text = encode_one(
+            "fn f() { alt atomic(seqcst) @[rax]: u64 = rbx; return; }",
+        );
+        // 48 87 18 = xchg qword [rax], rbx (no F0)
+        assert_eq!(text, vec![0x48, 0x87, 0x18], "xchg qword [rax],rbx");
+    }
+
+    /// Non-fitting immediate uses the imm32 form: F0 48 81 00 <imm32>.
+    #[test]
+    fn atomic_add_big_imm_uses_imm32() {
+        let text = encode_one(
+            "fn f() { alt atomic(relaxed) @[rax]: u64 += 0x1234; return; }",
+        );
+        assert_eq!(text[0..4], [0xF0, 0x48, 0x81, 0x00]);
+        assert_eq!(text.len(), 8);
+    }
 }

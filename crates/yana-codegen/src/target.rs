@@ -6,7 +6,9 @@ use yana_ast::place::SectionKind;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arch {
     X86_64,
-    // AArch64 / Xtensa come later (§13 🟡)
+    /// AArch64 target facts (§13 🟡). No backend exists yet; the description
+    /// drives diagnostics such as `unsupported-atomic-target` (§15, 30.10).
+    Aarch64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +34,12 @@ impl TargetInfo {
         TargetInfo { arch: Arch::X86_64, os: Os::Linux }
     }
 
+    /// AArch64/Linux target facts (§13 🟡). No backend exists yet — used by
+    /// the `unsupported-atomic-target` diagnostic test (§15, 30.10).
+    pub fn aarch64_linux() -> Self {
+        TargetInfo { arch: Arch::Aarch64, os: Os::Linux }
+    }
+
     /// rsp modulo the natural stack alignment at function entry, BEFORE any
     /// of the function's own pushes. SysV x86-64: the `call` pushed the
     /// return address, so rsp ≡ 8 (mod 16) at entry. AArch64 keeps sp
@@ -39,6 +47,7 @@ impl TargetInfo {
     pub fn stack_entry_offset(&self) -> i32 {
         match self.arch {
             Arch::X86_64 => 8,
+            Arch::Aarch64 => 0,
         }
     }
 
@@ -46,6 +55,7 @@ impl TargetInfo {
     pub fn usize_bits(&self) -> u32 {
         match self.arch {
             Arch::X86_64 => 64,
+            Arch::Aarch64 => 64,
         }
     }
 
@@ -54,6 +64,8 @@ impl TargetInfo {
         match (self.arch, self.os) {
             (Arch::X86_64, Os::Linux) => "_start",
             (Arch::X86_64, Os::Macos) => "_main",
+            (Arch::Aarch64, Os::Linux) => "_start",
+            (Arch::Aarch64, Os::Macos) => "_main",
         }
     }
 
@@ -70,19 +82,15 @@ impl TargetInfo {
         match (self.arch, self.os) {
             (Arch::X86_64, Os::Linux) => "elf64",
             (Arch::X86_64, Os::Macos) => "macho64",
+            (Arch::Aarch64, Os::Linux) => "elf64",
+            (Arch::Aarch64, Os::Macos) => "macho64",
         }
     }
 
     /// Sections present in an object file for this target, in link order.
     pub fn sections(&self) -> &'static [SectionKind] {
         match (self.arch, self.os) {
-            (Arch::X86_64, Os::Linux) => &[
-                SectionKind::Text,
-                SectionKind::RoData,
-                SectionKind::Data,
-                SectionKind::Bss,
-            ],
-            (Arch::X86_64, Os::Macos) => &[
+            (Arch::X86_64, Os::Linux) | (Arch::X86_64, Os::Macos) | (Arch::Aarch64, _) => &[
                 SectionKind::Text,
                 SectionKind::RoData,
                 SectionKind::Data,

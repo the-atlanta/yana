@@ -264,11 +264,16 @@ pub enum Stmt {
         pattern: Option<Vec<Param>>,
         span: Span,
     },
-    /// `alt dst <op>= src;` (§4.1, §4.2).
+    /// `alt [modifier] dst <op>= src;` (§4.1, §4.2; §12 for the modifiers).
     Alt {
         dst: Place,
         op: AssignOp,
         src: Value,
+        /// §12 modifier on the whole statement (atomic/volatile); the order
+        /// of an atomic RMW is carried here, kept for future targets (on
+        /// x86-64 every order encodes identically — lock RMW is a full
+        /// barrier).
+        modifier: AltModifier,
         span: Span,
     },
     /// `alt (rax, rdx) = pair /% d;` — divide with explicit hardware operands
@@ -335,6 +340,56 @@ pub struct CallArg {
     /// value already lives; matching the signature silences the mov.
     pub at: Option<Place>,
     pub span: Span,
+}
+
+/// §12 modifier on an `alt` statement: plain, atomic RMW, or volatile access.
+///
+/// - `alt atomic(order) ...` — locked read-modify-write. x86-64: one `lock`
+///   instruction (order recorded in the IR for future targets).
+/// - `alt volatile ...` — the analysis must not elide the access.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AltModifier {
+    /// Plain `alt` — no §12 modifier.
+    None,
+    /// `alt atomic(<order>) ...`.
+    Atomic(AtomicOrder),
+    /// `alt volatile ...`.
+    Volatile,
+}
+
+/// Memory order for `alt atomic(order)` (§12). Not keywords — parsed as
+/// identifiers with exact text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomicOrder {
+    Relaxed,
+    Acquire,
+    Release,
+    AcqRel,
+    SeqCst,
+}
+
+impl AtomicOrder {
+    /// Parse an order name as written in source. `None` = bad name.
+    pub fn parse(s: &str) -> Option<AtomicOrder> {
+        match s {
+            "relaxed" => Some(AtomicOrder::Relaxed),
+            "acquire" => Some(AtomicOrder::Acquire),
+            "release" => Some(AtomicOrder::Release),
+            "acqrel" => Some(AtomicOrder::AcqRel),
+            "seqcst" => Some(AtomicOrder::SeqCst),
+            _ => None,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            AtomicOrder::Relaxed => "relaxed",
+            AtomicOrder::Acquire => "acquire",
+            AtomicOrder::Release => "release",
+            AtomicOrder::AcqRel => "acqrel",
+            AtomicOrder::SeqCst => "seqcst",
+        }
+    }
 }
 
 /// Assignment operators (§4.1).

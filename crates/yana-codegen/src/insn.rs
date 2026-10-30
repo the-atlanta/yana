@@ -7,7 +7,7 @@
 //! and call status. Every analysis in pass 3 (liveness, definedness, stack
 //! depth, flags, clobbers) and every backend consumes this table only.
 
-use crate::ir::{CallContract, Insn, Jcc, Operand, WideOp};
+use crate::ir::{AtomicOp, CallContract, Insn, Jcc, Operand, WideOp};
 use yana_ast::reg::{GprBase, Reg};
 
 /// Which EFLAGS bits an instruction writes.
@@ -406,6 +406,28 @@ pub fn insn_info(i: &Insn) -> InsnInfo {
         },
         Insn::Int3 => InsnInfo { is_terminator: true, is_noreturn: true, ..base },
         Insn::Nop => base.clone(),
+        // §12: locked RMW. Register-wise it writes nothing (the memory cell
+        // is the destination); xchg-with-memory is implicitly locked and
+        // leaves flags untouched, the rest carry their non-atomic flag sets.
+        Insn::AtomicRMW { op, dst, src, .. } => {
+            let mut reads = operand_reads(src);
+            reads.extend(operand_reads(dst));
+            InsnInfo {
+                reads,
+                reads_mem: true,
+                writes_mem: true,
+                writes_flags: match op {
+                    AtomicOp::Exchange => FlagWrite::NONE,
+                    AtomicOp::Add | AtomicOp::Sub => FlagWrite::ARITH,
+                    AtomicOp::And | AtomicOp::Or | AtomicOp::Xor => FlagWrite::LOGIC,
+                },
+                is_volatile: true,
+                ..base
+            }
+        }
+        // §12 volatile wrapper: same facts as the inner instruction, but the
+        // analysis may never elide it.
+        Insn::Volatile(inner) => InsnInfo { is_volatile: true, ..insn_info(inner) },
     }
 }
 
@@ -634,5 +656,75 @@ mod tests {
         assert!(s.contains(&r64(GprBase::Bp)));
         assert!(s.contains(&r64(GprBase::R12)));
         assert!(!s.contains(&r64(GprBase::A)));
+    }
+
+    // ------------------------------------------------------------------
+    // §12: atomics / volatile
+    // ------------------------------------------------------------------
+
+    fn mem_op(base: GprBase) -> MemOp {
+        MemOp {
+            base: Some(r64(base)),
+            index: None,
+            scale: 1,
+            disp: Displacement::Const(0),
+            size: 64,
+            rip_relative: false,
+        }
+    }
+
+    #[test]
+    fn atomic_exchange_touches_no_flags() {
+        let i = insn_info(&Insn::AtomicRMW {
+            op: crate::ir::AtomicOp::Exchange,
+            dst: Operand::Mem(mem_op(GprBase::A)),
+            src: Operand::Reg(r64(GprBase::B)),
+            size: 64,
+            order: crate::ir::MemOrder::SeqCst,
+        });
+        assert!(!i.writes_flags.any(), "xchg does not touch flags");
+        assert!(i.is_volatile, "atomics are volatile to the analysis");
+        assert!(i.reads_mem && i.writes_mem, "locked RMW touches memory");
+        assert!(i.reads.contains(&r64(GprBase::A)), "address reg read");
+        assert!(i.reads.contains(&r64(GprBase::B)), "source reg read");
+        assert!(!i.writes.contains(&r64(GprBase::B)), "no register destination");
+        assert_eq!(i.stack_delta, 0);
+        assert!(!i.is_terminator && !i.is_call);
+    }
+
+    #[test]
+    fn atomic_add_writes_arith_flags() {
+        let i = insn_info(&Insn::AtomicRMW {
+            op: crate::ir::AtomicOp::Add,
+            dst: Operand::Mem(mem_op(GprBase::A)),
+            src: Operand::Imm(1),
+            size: 64,
+            order: crate::ir::MemOrder::Relaxed,
+        });
+        assert!(i.writes_flags.any(), "lock add writes flags like add");
+        assert!(i.writes_flags.zf && i.writes_flags.cf, "full ARITH group");
+        assert!(i.is_volatile);
+        // same flag set as the plain Add
+        let plain = insn_info(&Insn::Add {
+            dst: Operand::Mem(mem_op(GprBase::A)),
+            src: Operand::Imm(1),
+            size: 64,
+        });
+        assert_eq!(i.writes_flags, plain.writes_flags);
+    }
+
+    #[test]
+    fn volatile_delegates_to_inner() {
+        let inner = Insn::Mov { dst: Operand::Reg(r64(GprBase::A)), src: Operand::Imm(7), size: 64 };
+        let plain = insn_info(&inner);
+        let vol = insn_info(&Insn::Volatile(Box::new(inner.clone())));
+        assert!(!plain.is_volatile);
+        assert!(vol.is_volatile, "Volatile wrapper marks the access");
+        assert_eq!(vol.reads, plain.reads);
+        assert_eq!(vol.writes, plain.writes);
+        assert_eq!(vol.reads_mem, plain.reads_mem);
+        assert_eq!(vol.writes_mem, plain.writes_mem);
+        assert_eq!(vol.writes_flags, plain.writes_flags);
+        assert_eq!(vol.stack_delta, plain.stack_delta);
     }
 }

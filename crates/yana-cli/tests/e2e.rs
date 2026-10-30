@@ -444,3 +444,267 @@ fn main() -> ! {
         diags.iter().map(|d| (&d.kind, &d.level)).collect::<Vec<_>>()
     );
 }
+
+// ---------------------------------------------------------------------------
+// §12: atomics + volatile
+// ---------------------------------------------------------------------------
+
+const ATOMICS: &str = include_str!("../../../examples/atomics.yana");
+
+#[test]
+fn atomic_rmw_lowers_to_atomicrmw_insns() {
+    let (module, diags) = resolve(ATOMICS);
+    assert!(
+        !diags.iter().any(|d| matches!(d.level, yana_ast::DiagLevel::Error)),
+        "{:?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    let body = &module.bodies[0];
+    let atomics: Vec<&Insn> = body
+        .insns
+        .iter()
+        .filter(|s| matches!(&s.insn, Insn::AtomicRMW { .. }))
+        .map(|s| &s.insn)
+        .collect();
+    assert_eq!(atomics.len(), 3, "three atomic RMWs: {:?}", body.insns);
+    for a in atomics {
+        match a {
+            Insn::AtomicRMW { op, order, src, dst, size } => {
+                assert_eq!(*op, yana_codegen::AtomicOp::Add);
+                assert_eq!(*order, yana_codegen::MemOrder::Relaxed);
+                assert_eq!(*size, 64);
+                assert!(matches!(src, yana_codegen::Operand::Imm(_)));
+                assert!(matches!(dst, yana_codegen::Operand::Mem(_)));
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn atomic_encodes_lock_add_and_fixup_offsets_survive() {
+    // The rip-relative disp32 of `lock add [rel counter], N` sits BEFORE the
+    // trailing imm — the fixup must not clobber the immediate (§12 note).
+    let (module, _) = resolve(ATOMICS);
+    let enc = yana_back_iced::assemble_text(&module, Some(yana_back_iced::Layout::default_x86_64()))
+        .expect("assemble");
+    let dis = yana_back_iced::disassemble(&enc.text, 0).join("\n");
+    // layout resolves the symbol: `lock add qword ptr [2000h],3` — the disp
+    // is a concrete address, not [rip+…]; what matters is the immediate
+    // survived the fixup (the disp32 sits BEFORE the imm8).
+    assert!(dis.contains("lock add qword ptr ["), "{dis}");
+    assert!(dis.contains(",3h"), "{dis}");
+    assert!(dis.contains(",3"), "{dis}");
+    assert!(dis.contains(",4"), "{dis}");
+    assert!(dis.contains(",5"), "{dis}");
+}
+
+/// Full run: .data static counter, three atomic RMWs, exit with the sum (12).
+#[test]
+fn atomic_program_runs_and_exits_with_sum() {
+    // `run` builds a static ELF and executes it; the test binary shells out.
+    let exe = std::env::var("CARGO_BIN_EXE_yana-cli").ok();
+    // In `cargo test -p yana-cli`, the bin under test is available as
+    // CARGO_BIN_EXE_<name>. Fall back to building it if absent.
+    let yana = exe.unwrap_or_else(|| "target/debug/yana-cli".to_string());
+    let out = std::process::Command::new(&yana)
+        .arg("run")
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/atomics.yana"))
+        .status()
+        .expect("run yana-cli run examples/atomics.yana");
+    let code = out.code().unwrap_or(-1);
+    assert_eq!(code, 12, "3+4+5 must exit as 12, got {code}");
+}
+
+#[test]
+fn atomic_all_orders_and_ops_resolve() {
+    let src = r#"
+bind cell @ .data: u64 = 0;
+fn f() {
+    bind mut r @ rax: u64 = 1;
+    alt atomic(relaxed) [cell]: u64 += 1;
+    alt atomic(acquire) [cell]: u64 -= 1;
+    alt atomic(release) [cell]: u64 &= r;
+    alt atomic(acqrel) [cell]: u64 |= 2;
+    alt atomic(seqcst) [cell]: u64 ^= 4;
+    alt atomic(seqcst) [cell]: u64 = r;
+    return;
+}
+"#;
+    let (module, diags) = resolve(src);
+    assert!(
+        !diags.iter().any(|d| matches!(d.level, yana_ast::DiagLevel::Error)),
+        "{:?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    let body = &module.bodies[0];
+    let ops: Vec<yana_codegen::AtomicOp> = body
+        .insns
+        .iter()
+        .filter_map(|s| match &s.insn {
+            Insn::AtomicRMW { op, .. } => Some(*op),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ops,
+        vec![
+            yana_codegen::AtomicOp::Add,
+            yana_codegen::AtomicOp::Sub,
+            yana_codegen::AtomicOp::And,
+            yana_codegen::AtomicOp::Or,
+            yana_codegen::AtomicOp::Xor,
+            yana_codegen::AtomicOp::Exchange,
+        ],
+        "{:?}",
+        body.insns
+    );
+}
+
+#[test]
+fn atomic_register_target_is_error() {
+    let src = r#"
+fn f() {
+    bind mut x @ rax: u64 = 0;
+    alt atomic(relaxed) x += 1;
+    return;
+}
+"#;
+    let (_, diags) = resolve(src);
+    assert!(
+        diags.iter().any(|d| d.kind == "atomic-register"
+            && matches!(d.level, yana_ast::DiagLevel::Error)),
+        "expected atomic-register: {:?}",
+        diags.iter().map(|d| (&d.kind, &d.level)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn atomic_memory_source_is_error_with_help() {
+    let src = r#"
+bind a @ .data: u64 = 0;
+bind b @ .data: u64 = 1;
+fn f() {
+    alt atomic(relaxed) [a]: u64 += [b]: u64;
+    return;
+}
+"#;
+    let (_, diags) = resolve(src);
+    let d = diags
+        .iter()
+        .find(|d| d.kind == "atomic-src-memory")
+        .expect("atomic-src-memory diagnostic");
+    assert!(matches!(d.level, yana_ast::DiagLevel::Error));
+    assert_eq!(d.help.as_deref(), Some("load it into a register first"));
+}
+
+#[test]
+fn atomic_bad_order_is_syntax_error() {
+    let src = r#"
+fn f() {
+    alt atomic(sequentially) [rax]: u64 += 1;
+    return;
+}
+"#;
+    let parsed = yana_parser::parse(src);
+    assert!(
+        parsed.diagnostics.iter().any(|d| d.kind == "atomic-order"
+            && matches!(d.level, yana_ast::DiagLevel::Error)),
+        "expected atomic-order: {:?}",
+        parsed.diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn atomic_assign_imm_is_error_with_help() {
+    let src = r#"
+bind cell @ .data: u64 = 0;
+fn f() {
+    alt atomic(seqcst) [cell]: u64 = 42;
+    return;
+}
+"#;
+    let (_, diags) = resolve(src);
+    let d = diags
+        .iter()
+        .find(|d| d.kind == "atomic-assign-imm")
+        .expect("atomic-assign-imm diagnostic");
+    assert!(matches!(d.level, yana_ast::DiagLevel::Error));
+    assert_eq!(d.help.as_deref(), Some("xchg needs a register source: bind the value first"));
+}
+
+#[test]
+fn atomic_on_non_x86_64_target_is_error() {
+    // Owner decision 30.10: atomics on AArch64/Xtensa → unsupported on target.
+    let src = r#"
+fn f() {
+    alt atomic(relaxed) [rax]: u64 += 1;
+    return;
+}
+"#;
+    let parsed = yana_parser::parse(src);
+    let out = resolve_module(
+        parsed.file.as_ref().unwrap(),
+        &TargetInfo::aarch64_linux(),
+        &ResolveOptions::default(),
+    );
+    assert!(
+        out.diagnostics.iter().any(|d| d.kind == "unsupported-atomic-target"
+            && matches!(d.level, yana_ast::DiagLevel::Error)),
+        "expected unsupported-atomic-target: {:?}",
+        out.diagnostics.iter().map(|d| (&d.kind, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn volatile_wraps_inner_insn() {
+    let src = r#"
+fn f() {
+    bind mut x @ rbx: u64 = 5;
+    alt volatile x += 1;
+    return;
+}
+"#;
+    let (module, diags) = resolve(src);
+    assert!(
+        !diags.iter().any(|d| matches!(d.level, yana_ast::DiagLevel::Error)),
+        "{:?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    let body = &module.bodies[0];
+    // the store to memory via volatile is a Volatile(Add) — and the liveness
+    // analysis must not flag it dead even when its result is unused
+    assert!(
+        body.insns.iter().any(|s| matches!(&s.insn, Insn::Volatile(inner) if matches!(inner.as_ref(), Insn::Add { .. }))),
+        "expected Volatile(Add): {:?}",
+        body.insns
+    );
+}
+
+#[test]
+fn volatile_store_is_not_dead() {
+    // liveness: a volatile memory store must never be flagged dead (§12)
+    let src = r#"
+fn f() {
+    bind mut p @ rbx: *u64;
+    alt volatile [p]: u64 = 0;
+    return;
+}
+"#;
+    let (mut module, diags) = resolve(src);
+    assert!(
+        !diags.iter().any(|d| matches!(d.level, yana_ast::DiagLevel::Error)),
+        "{:?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    let analysis = yana_analysis::analyze(&mut module);
+    let dead: Vec<_> = analysis
+        .iter()
+        .filter(|d| d.kind == "dead-store" && d.message.contains("[p]") || d.message.contains("volatile"))
+        .collect();
+    assert!(
+        dead.is_empty(),
+        "volatile access must not be flagged dead: {:?}",
+        dead.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}

@@ -32,6 +32,8 @@ pub fn keywords() -> Vec<Item> {
         Item { label: "clobbers", detail: "порча регистров (§5.4)", docs: "clobbers: rcx, r11, — блок есть: портится ровно перечисленное.", insert: Some("clobbers:\n    ${1:rcx},\n    ${2:r11},") },
         Item { label: "mut", detail: "изменяемая привязка (§3)", docs: "По умолчанию привязка неизменяема; запись требует mut + alt.", insert: None },
         Item { label: "as", detail: "приведение (§4.2)", docs: "Расширение по знаковости источника; усечение берёт младшую часть (d as u8 = dl).", insert: None },
+        Item { label: "atomic", detail: "атомарный RMW (§12)", docs: "alt atomic(order) @[p]: u64 += 1; — одна locked-инструкция. Порядки: relaxed, acquire, release, acqrel, seqcst. Только x86-64.", insert: Some("alt atomic(${1|relaxed,acquire,release,acqrel,seqcst|}) ${2:@[p]}: u64 += ${3:1};") },
+        Item { label: "volatile", detail: "невыбрасываемый доступ (§12)", docs: "alt volatile @[p]: u64 = v; — анализ не вправе выбрасывать/переупорядочивать доступ.", insert: Some("alt volatile ${1:@[p]}: u64 = ${2:0};") },
         Item { label: "true", detail: "булево (const-выражения)", docs: "", insert: None },
         Item { label: "false", detail: "булево (const-выражения)", docs: "", insert: None },
         Item { label: "if", detail: "if-выражение (§8)", docs: "Только в const-контексте: if cond { a } else { b }", insert: Some("if ${1:cond} { ${2:a} } else { ${3:b} }") },
@@ -43,6 +45,25 @@ pub fn keywords() -> Vec<Item> {
 pub fn reserved() -> &'static [&'static str] {
     &["for", "volatile", "atomic", "preserves", "requires", "ensures", "invariant", "use", "mod", "macro", "macro_rules", "align", "let"]
 }
+
+/// §12 memory orders for `alt atomic(order)` completion.
+pub fn atomic_orders() -> Vec<Item> {
+    [
+        ("relaxed", "no ordering, только атомарность"),
+        ("acquire", "acquire-семантика загрузки"),
+        ("release", "release-семантика хранения"),
+        ("acqrel", "acquire + release"),
+        ("seqcst", "последовательная согласованность"),
+    ]
+    .into_iter()
+    .map(|(label, detail)| Item { label, detail, docs: "", insert: None })
+    .collect()
+}
+
+/// §12 summary for hover on `atomic`/`volatile`.
+pub const ATOMIC_HOVER: &str = "**§12 атомики**\n\n`alt atomic(<order>) <place> <op>= <value>;` — одна locked-инструкция (x86-64):\n`+=` lock add, `-=` lock sub, `&=` lock and, `|=` lock or, `^=` lock xor, `=` xchg [m],r (неявно locked).\nПорядки: relaxed, acquire, release, acqrel, seqcst (на x86-64 кодируются одинаково — lock RMW = полный барьер, порядок хранится в IR).\nМесто должно быть памятью; источник — регистр или константа. LL/SC циклы не поддерживаются. На не-x86-64 целях — ошибка «unsupported on target» (решение 30.10).";
+
+pub const VOLATILE_HOVER: &str = "**§12 volatile**\n\n`alt volatile <place> <op>= <value>;` — доступ, который анализ не вправе выбрасывать или переупорядочивать. Кодируется той же инструкцией, что и обычный alt.";
 
 /// All x86-64 register names, grouped.
 pub fn registers() -> Vec<(String, String)> {

@@ -9,3 +9,6 @@ repository.workspace = true
 yana-ast = { workspace = true }
 yana-codegen = { workspace = true }
 iced-x86 = { workspace = true }
+
+[dev-dependencies]
+yana-parser = { workspace = true }

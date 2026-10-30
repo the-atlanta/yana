@@ -236,6 +236,34 @@ pub enum WideOp {
     Signed,
 }
 
+/// §12 atomic RMW operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomicOp {
+    /// `=` → `xchg [m], r` (xchg with memory is implicitly locked).
+    Exchange,
+    /// `+=` → `lock add`
+    Add,
+    /// `-=` → `lock sub`
+    Sub,
+    /// `&=` → `lock and`
+    And,
+    /// `|=` → `lock or`
+    Or,
+    /// `^=` → `lock xor`
+    Xor,
+}
+
+/// §12 memory order. On x86-64 every order encodes identically (a locked RMW
+/// is a full barrier); the order is recorded in the IR for future targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemOrder {
+    Relaxed,
+    Acquire,
+    Release,
+    AcqRel,
+    SeqCst,
+}
+
 /// One machine instruction. Every variant maps to exactly one instruction of
 /// the target ISA (spec §0: visible expansion).
 #[derive(Debug, Clone)]
@@ -300,4 +328,19 @@ pub enum Insn {
     /// `int3` — fallthrough guard for `-> !` and debug traps.
     Int3,
     Nop,
+
+    // ---- §12: atomics / volatile ----
+    /// Locked read-modify-write: one `lock`-prefixed x86 instruction (or
+    /// implicitly-locked `xchg` with a memory operand). `dst` is memory,
+    /// `src` is a register or immediate.
+    AtomicRMW {
+        op: AtomicOp,
+        dst: Operand,
+        src: Operand,
+        size: u32,
+        order: MemOrder,
+    },
+    /// §12 volatile wrapper: the analysis must not elide or reorder the
+    /// inner access. Backends encode the inner instruction unchanged.
+    Volatile(Box<Insn>),
 }
