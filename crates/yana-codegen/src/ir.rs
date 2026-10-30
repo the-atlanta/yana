@@ -73,6 +73,11 @@ pub enum SymbolKind {
     Static { section: SectionKind, offset: u64, size: u64 },
     /// Build-time constant — no runtime presence, usable as an immediate.
     Const { value: i128 },
+    /// Imported static data (§10 `use`): an *undefined* symbol reference,
+    /// defined in another module's object file. Usable in places/`lea`
+    /// (Pc32 relocation); `size` feeds `name.len` at the importer.
+    /// No runtime presence in this module.
+    ExternStatic { size: u64 },
 }
 
 #[derive(Debug, Clone)]

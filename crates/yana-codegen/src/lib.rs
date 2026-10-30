@@ -11,6 +11,7 @@
 pub mod ir;
 pub mod insn;
 pub mod consteval;
+pub mod modules;
 pub mod target;
 pub mod resolve;
 
@@ -18,5 +19,5 @@ pub use ir::{
     DataItem, Displacement, FnBody, Insn, Jcc, LabelDef, MemOp, Module, Operand, SectionData,
     Symbol, SymbolKind, WideOp,
 };
-pub use target::{Arch, Os, ResolveOptions, TargetInfo};
+pub use target::{Arch, ImportedDecl, Os, ResolveOptions, TargetInfo};
 pub use resolve::resolve_module;

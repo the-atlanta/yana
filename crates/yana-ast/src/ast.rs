@@ -24,6 +24,13 @@ pub enum Item {
     ConstFn(ConstFnItem),
     /// `bind` at top level — a data-section binding (§7).
     Static(StaticBind),
+    /// `use path::name;` — a module import (§10).
+    ///
+    /// `path` is the colon-separated path as written. The last segment is the
+    /// item name; preceding segments form a file path relative to the importer's
+    /// directory. `use math::divmod` → file `math.yana`, item `divmod`;
+    /// `use lib::math::divmod` → `lib/math.yana`.
+    Use { path: Vec<(String, Span)>, span: Span },
 }
 
 /// An attribute: `#[name]` or `#[name(args)]` (§1).
@@ -166,6 +173,7 @@ impl ExternFnItem {
 /// `const NAME: T = expr;` (§7).
 #[derive(Debug, Clone)]
 pub struct ConstItem {
+    pub attrs: Vec<Attr>,
     pub name: String,
     pub name_span: Span,
     pub ty: Ty,
@@ -176,6 +184,7 @@ pub struct ConstItem {
 /// `const fn` (§8): evaluated at build time; body is `return <const expr>;`.
 #[derive(Debug, Clone)]
 pub struct ConstFnItem {
+    pub attrs: Vec<Attr>,
     pub name: String,
     pub name_span: Span,
     pub params: Vec<(String, Ty)>,

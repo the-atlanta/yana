@@ -1,0 +1,22 @@
+// math.yana — a used module (SPEC §10): one file, one object file.
+// Exports are `#[global]` only (`pub` was removed, §15).
+
+#[global]
+const BASE: u64 = 1000;
+
+// non-exported: importable names must be #[global]; this one is not
+fn hidden() -> rax: u64 {
+    alt rax = 1;
+    return;
+}
+
+#[global]
+fn add10(n @ rdi: u64) -> rax: u64
+clobbers:
+    rcx,
+    r11,
+{
+    alt rax = n;
+    alt rax += 10;
+    return;
+}

@@ -1,0 +1,7 @@
+// a → b → a: circular use
+use loop_b::f;
+
+#[entry]
+fn main() -> ! {
+    syscall;
+}

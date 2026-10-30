@@ -1,0 +1,7 @@
+// `hidden` exists in math.yana but is NOT #[global]
+use math::hidden;
+
+#[entry]
+fn main() -> ! {
+    syscall;
+}

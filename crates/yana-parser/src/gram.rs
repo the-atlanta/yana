@@ -265,8 +265,16 @@ pub fn static_bind(
 }
 
 /// Build a const item.
-pub fn const_item(name: Sp<String>, ty: Ty, value: ConstExpr, lo: usize, hi: usize) -> ConstItem {
+pub fn const_item(
+    attrs: Vec<Attr>,
+    name: Sp<String>,
+    ty: Ty,
+    value: ConstExpr,
+    lo: usize,
+    hi: usize,
+) -> ConstItem {
     ConstItem {
+        attrs,
         name: name.v,
         name_span: name.span,
         ty,
@@ -277,6 +285,7 @@ pub fn const_item(name: Sp<String>, ty: Ty, value: ConstExpr, lo: usize, hi: usi
 
 /// Build a const fn item. Body must be exactly `return <const expr>;` (§8).
 pub fn const_fn_item(
+    attrs: Vec<Attr>,
     name: Sp<String>,
     params: Vec<(String, Ty)>,
     ret: Option<Ty>,
@@ -284,6 +293,7 @@ pub fn const_fn_item(
     span: Span,
 ) -> ConstFnItem {
     ConstFnItem {
+        attrs,
         name: name.v,
         name_span: name.span,
         params,
@@ -359,3 +369,11 @@ pub fn item_extern(e: ExternFnItem) -> Item { Item::ExternFn(e) }
 pub fn item_const(c: ConstItem) -> Item { Item::Const(c) }
 pub fn item_constfn(c: ConstFnItem) -> Item { Item::ConstFn(c) }
 pub fn item_static(s: StaticBind) -> Item { Item::Static(s) }
+
+/// Build a `use path::name;` item (§10) from its spanned segments.
+pub fn item_use(path: Vec<Sp<String>>, lo: usize, hi: usize) -> Item {
+    Item::Use {
+        path: path.into_iter().map(|s| (s.v, s.span)).collect(),
+        span: Span::new(lo as u32, hi as u32),
+    }
+}
