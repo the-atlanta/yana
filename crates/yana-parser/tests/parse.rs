@@ -204,3 +204,31 @@ fn comments_captured_as_trivia() {
     assert!(out.comments.iter().any(|(_, c)| c.contains("leading")));
     assert!(out.comments.iter().any(|(_, c)| c.contains("trailing")));
 }
+
+// ---------------------------------------------------------------------------
+// `pub` removal (§15 ✅ 29.10) — precise diagnostic, not a generic parse error
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pub_keyword_is_a_precise_error() {
+    let src = "pub fn f() -> ! { syscall; }\n";
+    let out = parse(src);
+    assert!(out.file.is_none(), "pub fn must not parse");
+    let d = out
+        .diagnostics
+        .iter()
+        .find(|d| d.kind == "pub-removed")
+        .unwrap_or_else(|| panic!("expected pub-removed diag, got {:?}", out.diagnostics.iter().map(|d| &d.kind).collect::<Vec<_>>()));
+    assert!(d.message.contains("removed"), "{}", d.message);
+}
+
+#[test]
+fn global_attribute_exports() {
+    // #[global] is the surviving export mechanism.
+    let src = "#[global]\nfn f() -> ! { syscall; }\n";
+    let file = parse_ok(src);
+    match &file.items[0] {
+        Item::Fn(f) => assert!(f.exported, "#[global] must set exported"),
+        other => panic!("expected fn, got {other:?}"),
+    }
+}

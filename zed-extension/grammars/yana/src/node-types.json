@@ -890,10 +890,6 @@
         {
           "type": "attribute",
           "named": true
-        },
-        {
-          "type": "pub",
-          "named": true
         }
       ]
     }
@@ -1059,10 +1055,6 @@
         },
         {
           "type": "param",
-          "named": true
-        },
-        {
-          "type": "pub",
           "named": true
         },
         {
@@ -1730,10 +1722,6 @@
         {
           "type": "attribute",
           "named": true
-        },
-        {
-          "type": "pub",
-          "named": true
         }
       ]
     }
@@ -2028,10 +2016,6 @@
   {
     "type": "pop",
     "named": false
-  },
-  {
-    "type": "pub",
-    "named": true
   },
   {
     "type": "push",

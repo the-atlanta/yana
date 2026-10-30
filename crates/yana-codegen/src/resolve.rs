@@ -265,7 +265,7 @@ impl Resolver {
         self.module.symbols.push(Symbol {
             name: s.name.clone(),
             kind: SymbolKind::Static { section, offset, size },
-            exported: s.attrs.iter().any(|a| a.has_name("global")) || has_pub(&s.attrs),
+            exported: s.attrs.iter().any(|a| a.has_name("global")),
             syscall: None,
             clobbers: vec![],
             span: s.span,
@@ -1626,10 +1626,6 @@ fn stmt_span(s: &Stmt) -> Span {
         | Stmt::Label { span, .. } => *span,
         Stmt::Nested(b) => b.span,
     }
-}
-
-fn has_pub(attrs: &[yana_ast::Attr]) -> bool {
-    attrs.iter().any(|a| a.has_name("pub") || a.has_name("global"))
 }
 
 /// Result registers (normalized to 64-bit) declared by a return signature

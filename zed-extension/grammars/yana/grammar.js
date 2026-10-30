@@ -43,7 +43,6 @@ module.exports = grammar({
     // ---- functions ----
     fn_item: $ => seq(
       repeat($.attribute),
-      optional($.pub),
       'fn',
       field('name', $.ident),
       '(', optional(commaSep($.param)), ')',
@@ -65,7 +64,6 @@ module.exports = grammar({
     ),
 
     abi: $ => $.string,
-    pub: $ => 'pub',
 
     param: $ => seq(
       optional($.mut),
@@ -89,7 +87,6 @@ module.exports = grammar({
     // ---- consts ----
     const_item: $ => seq(
       repeat($.attribute),
-      optional($.pub),
       'const',
       field('name', $.ident),
       ':',
@@ -145,7 +142,6 @@ module.exports = grammar({
     // ---- statics ----
     static_bind: $ => seq(
       repeat($.attribute),
-      optional($.pub),
       'bind',
       field('name', $.ident),
       '@',

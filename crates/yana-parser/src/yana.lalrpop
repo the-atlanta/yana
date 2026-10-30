@@ -415,6 +415,9 @@ Item: Item = {
     <e: ExternFn>   => gram::item_extern(e),
     <c: ConstDecl>  => c,
     <s: StaticBind> => gram::item_static(s),
+    // `pub` was removed from the language (SPEC §15, решение 29.10) —
+    // fail with a precise diagnostic instead of a generic parse error.
+    <lo: @L> "pub" <hi: @R> =>? Err(gram::removed_pub(lo, hi)),
 };
 
 // `const fn name(...) -> T { return expr; }` and `const NAME: T = expr;` share
@@ -459,8 +462,8 @@ ClobbersOpt: Option<Clobbers> = {
 };
 
 FnItem: yana_ast::FnItem = {
-    <lo: @L> <attrs: Attrs> <p: "pub"?> "fn" <i: IdentSp> "(" <params: Comma0<Param>> ")" <ret: RetSig> <cl: ClobbersOpt> <body: Block> <hi: @R> =>
-        gram::fn_item(attrs, p.map(|_| Span::DUMMY), i, params, ret, cl, body, lo, hi),
+    <lo: @L> <attrs: Attrs> "fn" <i: IdentSp> "(" <params: Comma0<Param>> ")" <ret: RetSig> <cl: ClobbersOpt> <body: Block> <hi: @R> =>
+        gram::fn_item(attrs, i, params, ret, cl, body, lo, hi),
 };
 
 ExternFn: yana_ast::ExternFnItem = {
@@ -482,7 +485,7 @@ OptRetTy: Option<Ty> = {
 };
 
 StaticBind: yana_ast::StaticBind = {
-    <lo: @L> <attrs: Attrs> <p: "pub"?> "bind" <i: IdentSp> "@" <place: PlaceTyped> <init: StaticInit> ";" <hi: @R> =>
+    <lo: @L> <attrs: Attrs> "bind" <i: IdentSp> "@" <place: PlaceTyped> <init: StaticInit> ";" <hi: @R> =>
         gram::static_bind(attrs, i, place, init, lo, hi),
 };
 

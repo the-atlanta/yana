@@ -163,6 +163,10 @@ pub enum Token {
     /// token classes, so `Ident ":" Ident(reg)` is unambiguously a pair —
     /// collapsing it removes a 2-token ambiguity the LALR(1) parser can't split.
     PairReg((yana_ast::reg::Reg, yana_ast::reg::Reg, u32, u32)),
+    /// Synthetic: `pub` was removed from the language (SPEC §15, 29.10) —
+    /// the grammar fails with this token so the driver can emit a precise
+    /// "use #[global]" diagnostic instead of a generic parse error.
+    RemovedPub(BadLit),
 }
 
 /// Payload for synthetic error tokens (logos requires a single field).
@@ -201,6 +205,7 @@ impl std::fmt::Display for Token {
             Token::BadNum(b) => write!(f, "{}", b.text),
             Token::BadEscape(b) => write!(f, "{}", b.text),
             Token::BadReg(b) => write!(f, "{}", b.text),
+            Token::RemovedPub(_) => write!(f, "pub"),
             Token::PairReg((hi, lo, ..)) => write!(f, "{}:{}", hi.name(), lo.name()),
             other => write!(f, "{other:?}"),
         }

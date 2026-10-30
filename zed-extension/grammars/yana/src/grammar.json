@@ -191,18 +191,6 @@
           }
         },
         {
-          "type": "CHOICE",
-          "members": [
-            {
-              "type": "SYMBOL",
-              "name": "pub"
-            },
-            {
-              "type": "BLANK"
-            }
-          ]
-        },
-        {
           "type": "STRING",
           "value": "fn"
         },
@@ -442,10 +430,6 @@
       "type": "SYMBOL",
       "name": "string"
     },
-    "pub": {
-      "type": "STRING",
-      "value": "pub"
-    },
     "param": {
       "type": "SEQ",
       "members": [
@@ -663,18 +647,6 @@
             "type": "SYMBOL",
             "name": "attribute"
           }
-        },
-        {
-          "type": "CHOICE",
-          "members": [
-            {
-              "type": "SYMBOL",
-              "name": "pub"
-            },
-            {
-              "type": "BLANK"
-            }
-          ]
         },
         {
           "type": "STRING",
@@ -1508,18 +1480,6 @@
             "type": "SYMBOL",
             "name": "attribute"
           }
-        },
-        {
-          "type": "CHOICE",
-          "members": [
-            {
-              "type": "SYMBOL",
-              "name": "pub"
-            },
-            {
-              "type": "BLANK"
-            }
-          ]
         },
         {
           "type": "STRING",

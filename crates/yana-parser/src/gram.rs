@@ -147,8 +147,16 @@ pub fn build_addr(first: MemTerm, rest: Vec<SignedTerm>, span: Span) -> RawAddr 
 }
 
 /// `#[global]` also exports (§5.1).
-pub fn fn_exported(attrs: &[Attr], has_pub: bool) -> bool {
-    has_pub || attrs.iter().any(|a| a.has_name("global"))
+/// Export is `#[global]` only — the `pub` keyword was removed from the
+/// language (SPEC §15, решение Ники 29.10).
+pub fn fn_exported(attrs: &[Attr]) -> bool {
+    attrs.iter().any(|a| a.has_name("global"))
+}
+
+/// Fallible action for the removed `pub` keyword: produces the synthetic
+/// [`Token::RemovedPub`] the driver turns into a precise diagnostic.
+pub fn removed_pub(lo: usize, hi: usize) -> PErr {
+    user_err(Token::RemovedPub(yana_lexer::token::BadLit::new("pub", lo as u32, hi as u32)))
 }
 
 /// Dummy param for single-value return signatures.
@@ -187,7 +195,6 @@ pub fn call_stmt(
 /// Build a function item.
 pub fn fn_item(
     attrs: Vec<Attr>,
-    pub_: Option<Span>,
     name: Sp<String>,
     params: Vec<Param>,
     ret: RetSig,
@@ -197,7 +204,7 @@ pub fn fn_item(
     hi: usize,
 ) -> FnItem {
     FnItem {
-        exported: fn_exported(&attrs, pub_.is_some()),
+        exported: fn_exported(&attrs),
         attrs,
         sig: FnSig {
             name: name.v,

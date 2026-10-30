@@ -141,6 +141,13 @@ fn user_error_to_diag(tok: Token) -> Diagnostic {
             b.span(),
         )
         .with_help("Expected an x86-64 register name like rax, eax, dl, r8, r15b."),
+        Token::RemovedPub(b) => Diagnostic::error(
+            DiagCode::Syntax,
+            "pub-removed",
+            "`pub` was removed from the language",
+            b.span(),
+        )
+        .with_help("Export symbols with the `#[global]` attribute (SPEC §15, решение 29.10)."),
         other => Diagnostic::error(
             DiagCode::Syntax,
             "parse-error",

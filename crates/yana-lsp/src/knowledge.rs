@@ -28,7 +28,6 @@ pub fn keywords() -> Vec<Item> {
         Item { label: "label", detail: "блок-метка (§6)", docs: "label (имя) { ... } — метка = начало блока, управление проходит насквозь.", insert: Some("label (${1:name}) {\n    $0\n}") },
         Item { label: "fn", detail: "функция (§5.1)", docs: "fn имя([mut] парам @ место: тип, ...) -> результат { ... }", insert: Some("fn ${1:name}(${2:args}) -> ${3:rax: u64} {\n    $0\n}") },
         Item { label: "extern", detail: "внешняя функция (§5.5)", docs: "#[syscall(N)] extern fn write(fd @ rdi: u64, ...) -> rax: i64;", insert: Some("#[syscall(${1:1})]\nextern fn ${2:name}(${3:args}) -> ${4:rax: i64};") },
-        Item { label: "pub", detail: "экспорт символа (§5.1)", docs: "pub и #[global] — синонимы (решение между ними отложено).", insert: None },
         Item { label: "const", detail: "константа / const fn (§7, §8)", docs: "const NAME: T = выражение; const fn — вычисление при сборке, без памяти и регистров.", insert: Some("const ${1:NAME}: ${2:u64} = ${3:0};") },
         Item { label: "clobbers", detail: "порча регистров (§5.4)", docs: "clobbers: rcx, r11, — блок есть: портится ровно перечисленное.", insert: Some("clobbers:\n    ${1:rcx},\n    ${2:r11},") },
         Item { label: "mut", detail: "изменяемая привязка (§3)", docs: "По умолчанию привязка неизменяема; запись требует mut + alt.", insert: None },
@@ -141,7 +140,7 @@ pub fn attributes() -> Vec<Item> {
     vec![
         Item { label: "entry", detail: "точка входа (§5.1)", docs: "#[entry] — _start на Linux, _main на macOS; имя функции любое.", insert: Some("#[entry]") },
         Item { label: "syscall", detail: "номер syscall (§5.5)", docs: "#[syscall(1)] extern fn write(...) — раскрывается в mov rax,1; syscall.", insert: Some("#[syscall(${1:1})]") },
-        Item { label: "global", detail: "экспорт символа (§5.1)", docs: "Синоним pub (решение отложено).", insert: Some("#[global]") },
+        Item { label: "global", detail: "экспорт символа (§5.1)", docs: "Единственный способ экспорта символа (pub убран из языка, SPEC §15).", insert: Some("#[global]") },
         Item { label: "section", detail: "переопределение секции (§7)", docs: r#"#[section(".note")]"#, insert: Some(r#"#[section("${1:.data}")]"#) },
         Item { label: "align", detail: "выравнивание (§7)", docs: "#[align(16)]", insert: Some("#[align(${1:16})]") },
         Item { label: "cfg", detail: "условная компиляция (§13)", docs: r#"#[cfg(arch = "x86-64")], #[cfg(os = "linux")]"#, insert: Some(r#"#[cfg(${1:arch} = "${2:x86-64}")]"#) },
