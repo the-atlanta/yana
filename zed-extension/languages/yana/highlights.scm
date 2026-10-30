@@ -1,11 +1,20 @@
 ; YANA highlights — register names are idents lexically; mark the common
 ; GPR set explicitly (matches the closed register table in yana-ast).
 
+; Quoted string tokens exist as anonymous keywords in grammar.js — including
+; the new ones (use/macro/macro_rules/align/atomic/volatile).
 [
   "bind" "alt" "push" "pop" "branch" "call" "return" "syscall" "label"
   "fn" "extern" "const" "clobbers" "as"
   "if" "else"
+  "use" "macro" "macro_rules" "align" "atomic" "volatile"
 ] @keyword
+
+(metavar) @variable.parameter
+(macro_item name: (ident) @function.macro)
+(macro_rules_item name: (ident) @function.macro)
+(macro_invoke name: (ident) @function.call)
+(use_item (ident) @namespace)
 
 (mut) @keyword
 

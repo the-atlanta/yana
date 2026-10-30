@@ -13,6 +13,11 @@ module.exports = grammar({
 
   word: $ => $.ident,
 
+  conflicts: $ => [
+    // `$x` vs `$x:kind` — shift/reduce inside metavar itself
+    [$.metavar],
+  ],
+
   rules: {
     source: $ => repeat($._item),
 
@@ -24,7 +29,70 @@ module.exports = grammar({
       $.const_item,
       $.const_fn,
       $.static_bind,
-      // macro_item (§9) is not in the compiler MVP yet — grammar follows suit
+      $.use_item,
+      $.macro_item,
+      $.macro_rules_item,
+    ),
+
+    // ---- §10 modules ----
+    use_item: $ => seq(
+      'use',
+      field('name', $.ident),
+      repeat(seq('::', $.ident)),
+      ';',
+    ),
+
+    // ---- §9 macros (declarations; invocations are statements) ----
+    // The compiler removes both forms in a token-level pre-pass; the editor
+    // grammar keeps them permissive — bodies are token trees.
+    macro_item: $ => seq(
+      'macro',
+      field('name', $.ident),
+      '(', optional(commaSep($.macro_param)), ')',
+      $.macro_body,
+    ),
+    macro_param: $ => seq($.ident, ':', $.ident),
+    macro_rules_item: $ => seq(
+      'macro_rules', '!',
+      field('name', $.ident),
+      '{', repeat($.macro_arm), '}',
+    ),
+    macro_arm: $ => seq(
+      '(', repeat($._macro_frag), ')',
+      '=>',
+      $.macro_body,
+      ';',
+    ),
+    macro_body: $ => seq('{', repeat($._macro_frag), '}'),
+    // Macro patterns/bodies are TOKEN TREES (the compiler expands them in a
+    // token-level pre-pass) — the editor grammar keeps them permissive:
+    // balanced groups, metavariables, repetitions and loose tokens.
+    _macro_frag: $ => choice(
+      $.metavar,
+      $.macro_repetition,
+      $.macro_group,
+      $.ident, $.int, $.string, $.char, $.label_ref,
+      $.assign_op, $.cmpop, $.addop, $.mulop, $.shiftop,
+      ',', ';', ':', '!', '@', '&', '_', '->', '.',
+    ),
+    metavar: $ => seq('$', $.ident, optional(seq(':', $.ident))),
+    macro_repetition: $ => seq(
+      '$', '(', repeat($._macro_frag), ')',
+      optional(','),
+      choice('*', '+'),
+    ),
+    macro_group: $ => choice(
+      seq('(', repeat($._macro_frag), ')'),
+      seq('[', repeat($._macro_frag), ']'),
+      seq('{', repeat($._macro_frag), '}'),
+    ),
+    macro_invoke: $ => seq(
+      field('name', $.ident), '!',
+      choice(
+        seq('(', repeat($._macro_frag), ')'),
+        seq('{', repeat($._macro_frag), '}'),
+      ),
+      optional(';'),
     ),
 
     // ---- attributes ----
@@ -85,6 +153,10 @@ module.exports = grammar({
     ret_part: $ => seq(optional($.mut), $.ident, '@', $._place),
 
     // ---- consts ----
+    // `const NAME: T = expr;` — NAME can never be a register here (the
+    // compiler's pair-prepass only collapses reg:reg), and a const_expr never
+    // starts with a reg_pair, so this is unambiguous despite `ident ':'`
+    // also matching reg_pair elsewhere.
     const_item: $ => seq(
       repeat($.attribute),
       'const',
@@ -104,33 +176,31 @@ module.exports = grammar({
     ),
     const_param: $ => seq($.ident, ':', $._type),
 
-    // precedence ladder, loosest first
-    const_expr: $ => $._c_or,
-    _c_or: $ => prec.left(seq($._c_and, '||', $._c_or)),
-    _c_and: $ => prec.left(seq($._c_eq, '&&', $._c_and)),
-    _c_eq: $ => prec.left(seq($._c_cmp, $.eqop, $._c_eq)),
-    _c_cmp: $ => prec.left(seq($._c_bitor, $.cmpop, $._c_cmp)),
-    _c_bitor: $ => prec.left(seq($._c_bitxor, '|', $._c_bitor)),
-    _c_bitxor: $ => prec.left(seq($._c_bitand, '^', $._c_bitxor)),
-    _c_bitand: $ => prec.left(seq($._c_shift, '&', $._c_bitand)),
-    _c_shift: $ => prec.left(seq($._c_add, $.shiftop, $._c_shift)),
-    _c_add: $ => prec.left(seq($._c_mul, $.addop, $._c_add)),
-    _c_mul: $ => prec.left(seq($._c_un, $.mulop, $._c_mul)),
-    _c_un: $ => choice(
-      prec(1, seq('-', $._c_un)),
-      prec(1, seq('!', $._c_un)),
-      $._c_atom,
-    ),
-    _c_atom: $ => choice(
+    // const expressions: one flat rule with numeric precedence levels
+    // (loosest = lowest). The old ladder-per-level form couldn't reduce a
+    // single atom (bug: `const X: u8 = 1;` failed to parse) and LR-conflicted
+    // once each level passed through to the next.
+    const_expr: $ => choice(
       $.int,
       $.bool,
-      seq($.ident, '(', optional(commaSep($._c_or)), ')'),
       $.ident,
-      seq('(', $._c_or, ')'),
-      seq('(', commaSep2($._c_or), ')'),
-      seq('[', optional(commaSep($._c_or)), ']'),
-      seq('[', $._c_or, ';', $._c_or, ']'),
-      seq('if', $._c_or, '{', $._c_or, '}', 'else', '{', $._c_or, '}'),
+      seq($.ident, '(', optional(commaSep($.const_expr)), ')'),
+      seq('(', $.const_expr, ')'),
+      seq('(', commaSep2($.const_expr), ')'),
+      seq('[', optional(commaSep($.const_expr)), ']'),
+      seq('[', $.const_expr, ';', $.const_expr, ']'),
+      seq('if', $.const_expr, '{', $.const_expr, '}', 'else', '{', $.const_expr, '}'),
+      prec.left(1, seq($.const_expr, '||', $.const_expr)),
+      prec.left(2, seq($.const_expr, '&&', $.const_expr)),
+      prec.left(3, seq($.const_expr, $.cmpop, $.const_expr)),
+      prec.left(5, seq($.const_expr, '|', $.const_expr)),
+      prec.left(6, seq($.const_expr, '^', $.const_expr)),
+      prec.left(7, seq($.const_expr, '&', $.const_expr)),
+      prec.left(8, seq($.const_expr, $.shiftop, $.const_expr)),
+      prec.left(9, seq($.const_expr, $.addop, $.const_expr)),
+      prec.left(10, seq($.const_expr, $.mulop, $.const_expr)),
+      prec(11, seq('-', $.const_expr)),
+      prec(11, seq('!', $.const_expr)),
     ),
     eqop: $ => choice('==', '!='),
     cmpop: $ => choice('<', '<=', '>', '>='),
@@ -163,8 +233,12 @@ module.exports = grammar({
       $.return_stmt,
       $.syscall_stmt,
       $.label_stmt,
+      $.align_stmt,
+      $.macro_invoke,
       $.block,
     ),
+
+    align_stmt: $ => seq('align', $.int, ';'),
 
     bind_stmt: $ => seq(
       'bind',
@@ -180,6 +254,10 @@ module.exports = grammar({
 
     alt_stmt: $ => seq(
       'alt',
+      optional(choice(
+        'volatile',
+        seq('atomic', '(', $.ident, ')'),
+      )),
       choice(
         seq('(', commaSep2($.ident), ')', '=', $._place, '/%', $._value),
         seq(field('dst', $._place), $.assign_op, field('src', $._value)),
@@ -256,6 +334,7 @@ module.exports = grammar({
     named: $ => seq($.ident, optional(seq(':', $._type))),
 
     mem: $ => seq(
+      optional('@'),
       '[',
       commaSep1($._mem_term),
       ']',

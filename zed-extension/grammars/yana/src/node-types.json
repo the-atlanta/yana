@@ -20,6 +20,21 @@
     "fields": {}
   },
   {
+    "type": "align_stmt",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "int",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "alt_stmt",
     "named": true,
     "fields": {
@@ -501,6 +516,10 @@
       "required": false,
       "types": [
         {
+          "type": "align_stmt",
+          "named": true
+        },
+        {
           "type": "alt_stmt",
           "named": true
         },
@@ -522,6 +541,10 @@
         },
         {
           "type": "label_stmt",
+          "named": true
+        },
+        {
+          "type": "macro_invoke",
           "named": true
         },
         {
@@ -756,7 +779,7 @@
           "named": true
         },
         {
-          "type": "eqop",
+          "type": "const_expr",
           "named": true
         },
         {
@@ -965,7 +988,7 @@
     }
   },
   {
-    "type": "eqop",
+    "type": "discard",
     "named": true,
     "fields": {}
   },
@@ -1106,6 +1129,407 @@
     }
   },
   {
+    "type": "macro_arm",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "addop",
+          "named": true
+        },
+        {
+          "type": "assign_op",
+          "named": true
+        },
+        {
+          "type": "char",
+          "named": true
+        },
+        {
+          "type": "cmpop",
+          "named": true
+        },
+        {
+          "type": "ident",
+          "named": true
+        },
+        {
+          "type": "int",
+          "named": true
+        },
+        {
+          "type": "label_ref",
+          "named": true
+        },
+        {
+          "type": "macro_body",
+          "named": true
+        },
+        {
+          "type": "macro_group",
+          "named": true
+        },
+        {
+          "type": "macro_repetition",
+          "named": true
+        },
+        {
+          "type": "metavar",
+          "named": true
+        },
+        {
+          "type": "mulop",
+          "named": true
+        },
+        {
+          "type": "shiftop",
+          "named": true
+        },
+        {
+          "type": "string",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "macro_body",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "addop",
+          "named": true
+        },
+        {
+          "type": "assign_op",
+          "named": true
+        },
+        {
+          "type": "char",
+          "named": true
+        },
+        {
+          "type": "cmpop",
+          "named": true
+        },
+        {
+          "type": "ident",
+          "named": true
+        },
+        {
+          "type": "int",
+          "named": true
+        },
+        {
+          "type": "label_ref",
+          "named": true
+        },
+        {
+          "type": "macro_group",
+          "named": true
+        },
+        {
+          "type": "macro_repetition",
+          "named": true
+        },
+        {
+          "type": "metavar",
+          "named": true
+        },
+        {
+          "type": "mulop",
+          "named": true
+        },
+        {
+          "type": "shiftop",
+          "named": true
+        },
+        {
+          "type": "string",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "macro_group",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "addop",
+          "named": true
+        },
+        {
+          "type": "assign_op",
+          "named": true
+        },
+        {
+          "type": "char",
+          "named": true
+        },
+        {
+          "type": "cmpop",
+          "named": true
+        },
+        {
+          "type": "ident",
+          "named": true
+        },
+        {
+          "type": "int",
+          "named": true
+        },
+        {
+          "type": "label_ref",
+          "named": true
+        },
+        {
+          "type": "macro_group",
+          "named": true
+        },
+        {
+          "type": "macro_repetition",
+          "named": true
+        },
+        {
+          "type": "metavar",
+          "named": true
+        },
+        {
+          "type": "mulop",
+          "named": true
+        },
+        {
+          "type": "shiftop",
+          "named": true
+        },
+        {
+          "type": "string",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "macro_invoke",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "ident",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "addop",
+          "named": true
+        },
+        {
+          "type": "assign_op",
+          "named": true
+        },
+        {
+          "type": "char",
+          "named": true
+        },
+        {
+          "type": "cmpop",
+          "named": true
+        },
+        {
+          "type": "ident",
+          "named": true
+        },
+        {
+          "type": "int",
+          "named": true
+        },
+        {
+          "type": "label_ref",
+          "named": true
+        },
+        {
+          "type": "macro_group",
+          "named": true
+        },
+        {
+          "type": "macro_repetition",
+          "named": true
+        },
+        {
+          "type": "metavar",
+          "named": true
+        },
+        {
+          "type": "mulop",
+          "named": true
+        },
+        {
+          "type": "shiftop",
+          "named": true
+        },
+        {
+          "type": "string",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "macro_item",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "ident",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "macro_body",
+          "named": true
+        },
+        {
+          "type": "macro_param",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "macro_param",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "ident",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "macro_repetition",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "addop",
+          "named": true
+        },
+        {
+          "type": "assign_op",
+          "named": true
+        },
+        {
+          "type": "char",
+          "named": true
+        },
+        {
+          "type": "cmpop",
+          "named": true
+        },
+        {
+          "type": "ident",
+          "named": true
+        },
+        {
+          "type": "int",
+          "named": true
+        },
+        {
+          "type": "label_ref",
+          "named": true
+        },
+        {
+          "type": "macro_group",
+          "named": true
+        },
+        {
+          "type": "macro_repetition",
+          "named": true
+        },
+        {
+          "type": "metavar",
+          "named": true
+        },
+        {
+          "type": "mulop",
+          "named": true
+        },
+        {
+          "type": "shiftop",
+          "named": true
+        },
+        {
+          "type": "string",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "macro_rules_item",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "ident",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "macro_arm",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "mem",
     "named": true,
     "fields": {},
@@ -1123,6 +1547,21 @@
         },
         {
           "type": "prim_type",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "metavar",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "ident",
           "named": true
         }
       ]
@@ -1522,7 +1961,19 @@
           "named": true
         },
         {
+          "type": "macro_item",
+          "named": true
+        },
+        {
+          "type": "macro_rules_item",
+          "named": true
+        },
+        {
           "type": "static_bind",
+          "named": true
+        },
+        {
+          "type": "use_item",
           "named": true
         }
       ]
@@ -1737,6 +2188,32 @@
     "fields": {}
   },
   {
+    "type": "use_item",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "ident",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "ident",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "!",
     "named": false
   },
@@ -1750,6 +2227,10 @@
   },
   {
     "type": "#[",
+    "named": false
+  },
+  {
+    "type": "$",
     "named": false
   },
   {
@@ -1829,6 +2310,10 @@
     "named": false
   },
   {
+    "type": "::",
+    "named": false
+  },
+  {
     "type": ";",
     "named": false
   },
@@ -1897,11 +2382,23 @@
     "named": false
   },
   {
+    "type": "_",
+    "named": false
+  },
+  {
+    "type": "align",
+    "named": false
+  },
+  {
     "type": "alt",
     "named": false
   },
   {
     "type": "as",
+    "named": false
+  },
+  {
+    "type": "atomic",
     "named": false
   },
   {
@@ -1936,10 +2433,6 @@
   {
     "type": "const",
     "named": false
-  },
-  {
-    "type": "discard",
-    "named": true
   },
   {
     "type": "else",
@@ -2002,6 +2495,14 @@
     "named": false
   },
   {
+    "type": "macro",
+    "named": false
+  },
+  {
+    "type": "macro_rules",
+    "named": false
+  },
+  {
     "type": "mut",
     "named": true
   },
@@ -2058,7 +2559,15 @@
     "named": false
   },
   {
+    "type": "use",
+    "named": false
+  },
+  {
     "type": "usize",
+    "named": false
+  },
+  {
+    "type": "volatile",
     "named": false
   },
   {
