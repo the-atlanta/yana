@@ -751,8 +751,12 @@ impl Resolver {
                     });
                     self.labels.insert(name.clone(), def);
                 }
-                let _ = span;
+                // §3: the label body is a block — `bind` inside is scoped to it,
+                // so the same register may be re-bound in a sibling label.
+                self.push_scope();
                 self.lower_block(body);
+                self.pop_scope();
+                let _ = span;
             }
             Stmt::Nested(b) => {
                 self.push_scope();

@@ -153,6 +153,41 @@ fn f() {
 }
 
 #[test]
+fn sibling_labels_scope_their_binds() {
+    // §3/§6: a label body is a block — the same register may be re-bound in
+    // a sibling label (the old behavior leaked binds across label bodies).
+    let src = r#"
+fn f() {
+    label (a) { bind mut i @ rdi: u64 = 5; }
+    label (b) { bind mut j @ rdi: u64 = 7; }
+}
+"#;
+    let (_, diags) = resolve(src);
+    assert!(
+        !diags.iter().any(|d| d.kind == "reg-conflict"),
+        "sibling label binds must not conflict: {:?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn bind_leaves_scope_after_label_body() {
+    // a name bound inside a label body is NOT visible after it
+    let src = r#"
+fn f() {
+    label (a) { bind mut i @ rdi: u64 = 5; }
+    alt i = 1;
+}
+"#;
+    let (_, diags) = resolve(src);
+    assert!(
+        diags.iter().any(|d| matches!(d.level, yana_ast::DiagLevel::Error)),
+        "expected error using out-of-scope bind, got {:?}",
+        diags.iter().map(|d| (&d.kind, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn wrong_pair_order_is_error() {
     let src = r#"
 fn f() {

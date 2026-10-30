@@ -1,0 +1,19 @@
+// Sibling labels: `bind` inside a label block is scoped to it (§3/§6),
+// so the same register may be re-bound in a sibling label without conflict.
+// NOTE: a backward branch to a label re-executes its body including binds —
+// no loops here, this is a pure scoping demo. Exit code = rdi at syscall = 5.
+#[entry]
+fn main() -> ! {
+    label (a) {
+        bind mut i @ rdi: u64 = 5;
+        branch => 'out;
+    }
+    label (b) {
+        bind mut j @ rdi: u64 = 7;  // same register, sibling label — must be OK
+        branch => 'out;
+    }
+    label (out) {
+        alt rax = 60;
+        syscall;
+    }
+}
