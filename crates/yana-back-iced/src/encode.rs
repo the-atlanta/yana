@@ -155,7 +155,7 @@ pub fn assemble_text(module: &Module, layout: Option<Layout>) -> Result<EncodedT
         // size this body with dummy encodings
         let mut enc = Encoder::new(64);
         for ins in &body.insns {
-            let i = build_insn(ins, &sym_vaddrs, layout, base)?;
+            let i = build_insn(&ins.insn, &sym_vaddrs, layout, base)?;
             let n = enc.encode(&i, ip).map_err(|e| AsmError::Encode(e.to_string()))?;
             enc.take_buffer();
             ip += n as u64;
@@ -190,7 +190,7 @@ pub fn assemble_text(module: &Module, layout: Option<Layout>) -> Result<EncodedT
             let mut enc2 = Encoder::new(64);
             for ins in &body.insns {
                 insn_ips.push(cur);
-                let i = build_insn(ins, &sym_vaddrs, layout, base)?;
+                let i = build_insn(&ins.insn, &sym_vaddrs, layout, base)?;
                 let n = enc2.encode(&i, cur).map_err(|e| AsmError::Encode(e.to_string()))?;
                 enc2.take_buffer();
                 cur += n as u64;
@@ -203,10 +203,10 @@ pub fn assemble_text(module: &Module, layout: Option<Layout>) -> Result<EncodedT
         }
 
         for (idx, ins) in body.insns.iter().enumerate() {
-            let mut i = build_insn(ins, &sym_vaddrs, layout, base)?;
+            let mut i = build_insn(&ins.insn, &sym_vaddrs, layout, base)?;
             // Branch targets are resolved before encoding (rel32 length is
             // value-independent), so the encoder writes the correct field.
-            let call_sym = match ins {
+            let call_sym = match &ins.insn {
                 Insn::Jmp { label } | Insn::Jcc { label, .. } => {
                     let target = *label_ips.get(label).ok_or_else(|| {
                         AsmError::Unresolved(format!("label index {label} has no definition"))
@@ -214,7 +214,7 @@ pub fn assemble_text(module: &Module, layout: Option<Layout>) -> Result<EncodedT
                     set_branch_target(&mut i, target);
                     None
                 }
-                Insn::Call { sym } => Some(*sym),
+                Insn::Call { sym, .. } => Some(*sym),
                 _ => None,
             };
             let n = enc.encode(&i, ip).map_err(|e| AsmError::Encode(e.to_string()))?;
@@ -239,7 +239,7 @@ pub fn assemble_text(module: &Module, layout: Option<Layout>) -> Result<EncodedT
                 }
             }
             // LeaSym rip-relative fixup: field is the disp32 at end
-            if let Insn::LeaSym { sym, add, .. } = ins {
+            if let Insn::LeaSym { sym, add, .. } = &ins.insn {
                 let field_off = text.len() + n - 4;
                 match sym_vaddrs.get(sym).copied().flatten() {
                     Some(v) => fixups.push((field_off, Fixup::Rip32 { target: v as i64 + *add, next_ip: ip + n as u64 })),
@@ -262,7 +262,7 @@ pub fn assemble_text(module: &Module, layout: Option<Layout>) -> Result<EncodedT
             // immediate; for the MVP instruction set (mov/add/... with Sym
             // disp) disp32 is also the last 4 bytes when there is no imm.
             if let Insn::Mov { src: Operand::Mem(m), .. } | Insn::Add { src: Operand::Mem(m), .. }
-                | Insn::Sub { src: Operand::Mem(m), .. } | Insn::Cmp { b: Operand::Mem(m), .. } = ins
+                | Insn::Sub { src: Operand::Mem(m), .. } | Insn::Cmp { b: Operand::Mem(m), .. } = &ins.insn
             {
                 if let Displacement::Sym { sym, add } = &m.disp {
                     if m.index.is_none() {

@@ -18,8 +18,8 @@ use yana_ast::{
 use crate::consteval::{self, ConstEnv, Value as CValue};
 use crate::insn;
 use crate::ir::{
-    DataItem, Displacement, FnBody, Insn, Jcc, LabelDef, MemOp, Module, Operand, SectionData,
-    Symbol, SymbolKind, WideOp,
+    BranchUse, CallContract, DataItem, Displacement, FnBody, Insn, Jcc, LabelDef, MemOp, Module,
+    Operand, SectionData, SpannedInsn, Symbol, SymbolKind, WideOp,
 };
 use crate::target::{ResolveOptions, TargetInfo};
 
@@ -77,10 +77,13 @@ struct Resolver {
     body: FnBody,
     /// label name → index into body.label_defs
     labels: HashMap<String, usize>,
-    /// jumps awaiting label resolution: (insn index, label name, span)
-    pending_jumps: Vec<(usize, String, Span)>,
+    /// jumps awaiting label resolution: (insn index, label name, span, scope depth)
+    pending_jumps: Vec<(usize, String, Span, u32)>,
     cur_ret: RetSig,
     cur_fn_span: Span,
+    /// Span of the statement currently being lowered — every emitted
+    /// instruction is tagged with it (§14: spans in the IR).
+    cur_span: Span,
 }
 
 /// Owned const env (ConstEnv borrows fns; we clone them in).
@@ -140,6 +143,7 @@ impl Resolver {
             pending_jumps: Vec::new(),
             cur_ret: RetSig::None,
             cur_fn_span: Span::DUMMY,
+            cur_span: Span::DUMMY,
             target,
             opts,
             module: Module::default(),
@@ -485,7 +489,7 @@ impl Resolver {
             None => return, // dup-symbol already reported
         };
         // fresh per-function state
-        self.body = FnBody { symbol: info.sym, insns: Vec::new(), label_defs: Vec::new() };
+        self.body = FnBody { symbol: info.sym, insns: Vec::new(), label_defs: Vec::new(), branches: Vec::new() };
         self.labels.clear();
         self.pending_jumps.clear();
         self.scopes.clear();
@@ -502,13 +506,17 @@ impl Resolver {
 
         self.lower_block(&f.body);
 
-        // backpatch jumps
-        for (idx, name, span) in std::mem::take(&mut self.pending_jumps) {
+        // backpatch jumps and record branch uses with scope depths (§6 check
+        // lives in the analysis pass: jumping into a nested block is illegal)
+        for (idx, name, span, depth) in std::mem::take(&mut self.pending_jumps) {
             match self.labels.get(&name) {
-                Some(&def) => match &mut self.body.insns[idx] {
-                    Insn::Jmp { label } | Insn::Jcc { label, .. } => *label = def,
-                    _ => unreachable!(),
-                },
+                Some(&def) => {
+                    match &mut self.body.insns[idx].insn {
+                        Insn::Jmp { label } | Insn::Jcc { label, .. } => *label = def,
+                        _ => unreachable!(),
+                    }
+                    self.body.branches.push(BranchUse { insn: idx, label: def, scope_depth: depth, span });
+                }
                 None => self.err(
                     "unknown-label",
                     format!("label '{name} is not defined in this function"),
@@ -525,6 +533,35 @@ impl Resolver {
                 *slot = body_index;
             }
         }
+    }
+
+    /// Build the brief contract summary for a call site (§14).
+    fn call_contract(&self, info: &FnInfo) -> CallContract {
+        let results = match &info.ret {
+            RetInfo::Single { operand, .. } => match operand {
+                Operand::Reg(r) => vec![r.resize(yana_ast::reg::RegSize::R64).unwrap_or(*r)],
+                _ => vec![],
+            },
+            RetInfo::Tuple { parts } => parts
+                .iter()
+                .filter_map(|p| match &p.operand {
+                    Operand::Reg(r) => Some(r.resize(yana_ast::reg::RegSize::R64).unwrap_or(*r)),
+                    _ => None,
+                })
+                .collect(),
+            _ => vec![],
+        };
+        let noreturn = matches!(info.ret, RetInfo::Never);
+        // clobbers: externs must declare them (§5.4); we stored declared ones
+        // on the Symbol; local fns get derived clobbers after analysis (pass 3)
+        // — until then, conservatively: everything the callee's symbol lists.
+        let clobbers = self
+            .module
+            .symbols
+            .get(info.sym)
+            .map(|s| s.clobbers.clone())
+            .unwrap_or_default();
+        CallContract { clobbers, results, noreturn, syscall: info.syscall }
     }
 
     fn has_errors(&self) -> bool {
@@ -547,7 +584,7 @@ impl Resolver {
     }
 
     fn emit(&mut self, i: Insn) -> usize {
-        self.body.insns.push(i);
+        self.body.insns.push(SpannedInsn::new(i, self.cur_span));
         self.body.insns.len() - 1
     }
 
@@ -558,6 +595,7 @@ impl Resolver {
     }
 
     fn lower_stmt(&mut self, s: &Stmt) {
+        self.cur_span = stmt_span(s);
         match s {
             Stmt::Bind { mutable, name, name_span, place, init, pattern, span } => {
                 if let Some(pat) = pattern {
@@ -665,7 +703,7 @@ impl Resolver {
                         self.emit(Insn::Jcc { cc, label: usize::MAX })
                     }
                 };
-                self.pending_jumps.push((idx, target.clone(), target_span.merge(*span)));
+                self.pending_jumps.push((idx, target.clone(), target_span.merge(*span), self.scopes.len() as u32));
             }
             Stmt::Call { results, name, name_span, args, span } => {
                 self.lower_call(results, name, *name_span, args, *span);
@@ -685,6 +723,7 @@ impl Resolver {
                     self.body.label_defs.push(LabelDef {
                         name: name.clone(),
                         at_insn: self.body.insns.len(),
+                        scope_depth: self.scopes.len() as u32,
                     });
                     self.labels.insert(name.clone(), def);
                 }
@@ -1054,7 +1093,8 @@ impl Resolver {
             });
             self.emit(Insn::Syscall);
         } else {
-            self.emit(Insn::Call { sym: info.sym });
+            let contract = self.call_contract(&info);
+            self.emit(Insn::Call { sym: info.sym, contract });
         }
 
         // results (§5.3)
@@ -1545,6 +1585,22 @@ impl Resolver {
 enum LeaSrc {
     Mem(MemOp),
     Sym { sym: usize, add: i64 },
+}
+
+fn stmt_span(s: &Stmt) -> Span {
+    match s {
+        Stmt::Bind { span, .. }
+        | Stmt::Alt { span, .. }
+        | Stmt::DivMod { span, .. }
+        | Stmt::Push { span, .. }
+        | Stmt::Pop { span, .. }
+        | Stmt::Branch { span, .. }
+        | Stmt::Call { span, .. }
+        | Stmt::Return { span, .. }
+        | Stmt::Syscall { span, .. }
+        | Stmt::Label { span, .. } => *span,
+        Stmt::Nested(b) => b.span,
+    }
 }
 
 fn has_pub(attrs: &[yana_ast::Attr]) -> bool {

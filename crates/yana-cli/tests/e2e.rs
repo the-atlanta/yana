@@ -91,7 +91,7 @@ fn main() -> ! {
     let (module, _) = resolve(src);
     let body = &module.bodies[0];
     // expect: mov rax,100; mov rbx,7; xor edx,edx (extend pair unsigned); div rbx; syscall
-    let kinds: Vec<&Insn> = body.insns.iter().collect();
+    let kinds: Vec<&Insn> = body.insns.iter().map(|s| &s.insn).collect();
     assert!(kinds.iter().any(|i| matches!(i, Insn::ExtendPair { signed: false, .. })), "{kinds:?}");
     assert!(kinds.iter().any(|i| matches!(i, Insn::DivWide { op: yana_codegen::WideOp::Unsigned, .. })), "{kinds:?}");
 }
@@ -113,7 +113,7 @@ fn main() -> ! {
     let movs: Vec<_> = body
         .insns
         .iter()
-        .filter_map(|i| match i {
+        .filter_map(|s| match &s.insn {
             Insn::Mov { dst: yana_codegen::Operand::Reg(r), src: yana_codegen::Operand::Imm(v), .. } => {
                 Some((r.name(), *v))
             }
@@ -216,7 +216,7 @@ fn f() -> rax: u64 {
 fn syscall_extern_lowers_to_mov_rax_syscall() {
     let (module, _) = resolve(HELLO);
     let body = &module.bodies[0];
-    let seq: Vec<&Insn> = body.insns.iter().collect();
+    let seq: Vec<&Insn> = body.insns.iter().map(|s| &s.insn).collect();
     // find `mov rax, 1` immediately followed by Syscall (the write extern)
     let found = seq.windows(2).any(|w| {
         matches!(w[0], Insn::Mov { dst: yana_codegen::Operand::Reg(r), src: yana_codegen::Operand::Imm(1), .. } if r.name() == "rax")
@@ -237,7 +237,7 @@ fn f() -> rsi: u64 {
     let (module, diags) = resolve(src);
     assert!(!diags.iter().any(|d| matches!(d.level, yana_ast::DiagLevel::Error)), "{:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     let body = &module.bodies[0];
-    assert!(body.insns.iter().any(|i| matches!(i, Insn::Mov { src: yana_codegen::Operand::Imm(4), .. })), "{:?}", body.insns);
+    assert!(body.insns.iter().any(|s| matches!(&s.insn, Insn::Mov { src: yana_codegen::Operand::Imm(4), .. })), "{:?}", body.insns);
 }
 
 #[test]
@@ -254,7 +254,7 @@ fn f(i @ rbx: u64) -> rax: u64 {
     let body = &module.bodies[0];
     // expect a mov rax, [rip-ish sym + rbx*8]
     assert!(
-        body.insns.iter().any(|i| matches!(i, Insn::Mov { src: yana_codegen::Operand::Mem(m), .. } if m.index.is_some() && m.scale == 8)),
+        body.insns.iter().any(|s| matches!(&s.insn, Insn::Mov { src: yana_codegen::Operand::Mem(m), .. } if m.index.is_some() && m.scale == 8)),
         "{:?}",
         body.insns
     );
@@ -273,7 +273,7 @@ fn f() {
     let slots: Vec<bool> = body
         .insns
         .iter()
-        .filter_map(|i| match i {
+        .filter_map(|s| match &s.insn {
             Insn::StackSlot { grow } => Some(*grow),
             _ => None,
         })

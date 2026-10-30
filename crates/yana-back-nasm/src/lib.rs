@@ -99,13 +99,16 @@ pub fn emit(module: &Module, comments: &[(u32, String)]) -> String {
             at.entry(def.at_insn.min(body.insns.len())).or_default().push(idx);
         }
 
-        for (i, ins) in body.insns.iter().enumerate() {
+        for (i, si) in body.insns.iter().enumerate() {
             if let Some(ls) = at.get(&i) {
                 for l in ls {
                     writeln!(out, "{}:", labels[l]).unwrap();
                 }
             }
-            writeln!(out, "    {}", insn_to_nasm(ins, module, &labels)).unwrap();
+            if let Some((_, c)) = &si.comment {
+                writeln!(out, "    ;{c}").unwrap();
+            }
+            writeln!(out, "    {}", insn_to_nasm(&si.insn, module, &labels)).unwrap();
         }
         if let Some(ls) = at.get(&body.insns.len()) {
             for l in ls {
@@ -122,7 +125,7 @@ fn is_called(module: &Module, sym: usize) -> bool {
         .bodies
         .iter()
         .flat_map(|b| b.insns.iter())
-        .any(|i| matches!(i, Insn::Call { sym: s } if *s == sym))
+        .any(|i| matches!(&i.insn, Insn::Call { sym: s, .. } if *s == sym))
 }
 
 fn sanitize(s: &str) -> String {
@@ -204,7 +207,7 @@ fn insn_to_nasm(ins: &Insn, module: &Module, labels: &HashMap<usize, String>) ->
         }
         Insn::Jmp { label } => format!("jmp {}", label_name(*label, labels)),
         Insn::Jcc { cc, label } => format!("{} {}", jcc_mnemonic(*cc), label_name(*label, labels)),
-        Insn::Call { sym } => format!("call {}", module.symbols[*sym].name),
+        Insn::Call { sym, .. } => format!("call {}", module.symbols[*sym].name),
         Insn::Syscall => "syscall".to_string(),
         Insn::Ret => "ret".to_string(),
         Insn::Int3 => "int3".to_string(),
@@ -327,8 +330,8 @@ pub fn expand_ir(module: &Module) -> String {
         for def in &body.label_defs {
             writeln!(out, "  label '{} -> insn #{}", def.name, def.at_insn).unwrap();
         }
-        for (i, ins) in body.insns.iter().enumerate() {
-            writeln!(out, "  {i:>4}: {}", nasm_line_dbg(ins, module, body)).unwrap();
+        for (i, si) in body.insns.iter().enumerate() {
+            writeln!(out, "  {i:>4}: {}", nasm_line_dbg(&si.insn, module, body)).unwrap();
         }
     }
     out

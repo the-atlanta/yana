@@ -3,8 +3,12 @@
 //! The IR is deliberately *close to the wire*: every [`Insn`] maps 1:1 to one
 //! machine instruction (spec §0 principle: constructions expand into a visible,
 //! known instruction set). Symbolic operands ([`Operand::Sym`]) and label
-//! references ([`Operand::Label`]) are resolved by the backend with
-//! backpatching; the IR itself never contains byte offsets.
+//! references are resolved by the backend with backpatching; the IR itself
+//! never contains byte offsets.
+//!
+//! §14 "заложить сразу": instructions carry source spans and trivia comments
+//! ([`SpannedInsn`]), and `call` nodes carry a brief contract description
+//! ([`CallContract`]) so analyses never need to look the callee up again.
 
 use yana_ast::place::SectionKind;
 use yana_ast::reg::Reg;
@@ -42,12 +46,13 @@ impl Module {
 pub struct Symbol {
     pub name: String,
     pub kind: SymbolKind,
-    /// Exported (`pub` / `#[global]`).
+    /// Exported (`#[global]`, spec §5.1 — the canonical form since 29.10).
     pub exported: bool,
     /// `#[syscall(N)]` externs carry their number.
     pub syscall: Option<i64>,
-    /// Declared clobbers for externs (spec §5.4); functions without a block get
-    /// derived clobbers (empty for MVP — analysis layer comes later).
+    /// Clobber contract (§5.4). Externs must declare it (or get the syscall
+    /// ABI default rcx/r11); functions derive it from the body in the
+    /// analysis pass and this field is filled in afterwards.
     pub clobbers: Vec<Reg>,
     pub span: Span,
 }
@@ -56,8 +61,8 @@ pub struct Symbol {
 pub enum SymbolKind {
     /// Has a body in [`Module::bodies`] (index stored alongside).
     Function { body_index: usize },
-    /// `extern fn` — no body; calls resolve to an undefined ELF symbol,
-    /// or to `mov rax,N; syscall` when `syscall` is set.
+    /// `extern fn` — no body; calls resolve to an undefined object symbol,
+    /// or lower inline to `mov rax,N; syscall` when `syscall` is set.
     ExternFn,
     /// Static data: `section` + `offset` within it + `size`.
     Static { section: SectionKind, offset: u64, size: u64 },
@@ -82,8 +87,30 @@ pub enum DataItem {
 #[derive(Debug, Default)]
 pub struct FnBody {
     pub symbol: usize,
-    pub insns: Vec<Insn>,
+    /// Instructions with provenance (span + attached trivia comment).
+    pub insns: Vec<SpannedInsn>,
     pub label_defs: Vec<LabelDef>,
+    /// Branch instructions and their lexical scope depth (§6: jumping INTO a
+    /// nested block is an error; the check compares depths).
+    pub branches: Vec<BranchUse>,
+}
+
+/// An instruction plus its source span and trivia comment (§14: "спаны и
+/// комментарии в IR").
+#[derive(Debug, Clone)]
+pub struct SpannedInsn {
+    pub insn: Insn,
+    pub span: Span,
+    /// A source comment attached to this instruction: `(byte_offset, text)`.
+    /// Offset before `span.lo` → the NASM backend prints it on its own line
+    /// above; otherwise it trails the instruction line.
+    pub comment: Option<(u32, String)>,
+}
+
+impl SpannedInsn {
+    pub fn new(insn: Insn, span: Span) -> Self {
+        SpannedInsn { insn, span, comment: None }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +119,35 @@ pub struct LabelDef {
     pub name: String,
     /// Index into [`FnBody::insns`] of the instruction that follows the label.
     pub at_insn: usize,
+    /// Lexical block depth where the label was declared (§6 scope rule).
+    pub scope_depth: u32,
+}
+
+/// One `branch` statement's use of a label.
+#[derive(Debug, Clone)]
+pub struct BranchUse {
+    /// Index of the Jmp/Jcc instruction in [`FnBody::insns`].
+    pub insn: usize,
+    /// Label index in [`FnBody::label_defs`].
+    pub label: usize,
+    /// Lexical block depth where the branch was written.
+    pub scope_depth: u32,
+    pub span: Span,
+}
+
+/// The brief contract description carried by every `call` node (§14: "`call`
+/// как узел с кратким описанием контракта"). Analyses consume this instead of
+/// re-deriving it from the symbol table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallContract {
+    /// Registers the callee may destroy (§5.4).
+    pub clobbers: Vec<Reg>,
+    /// Result registers, in signature order (§5.1).
+    pub results: Vec<Reg>,
+    /// `-> !` — never returns; the call is a terminator.
+    pub noreturn: bool,
+    /// Syscall number when this call lowers to `mov rax,N; syscall`.
+    pub syscall: Option<i64>,
 }
 
 /// An instruction operand.
@@ -167,8 +223,8 @@ pub enum WideOp {
     Signed,
 }
 
-/// One machine instruction. Every variant maps to exactly one x86-64 insn
-/// (spec §0: visible expansion).
+/// One machine instruction. Every variant maps to exactly one instruction of
+/// the target ISA (spec §0: visible expansion).
 #[derive(Debug, Clone)]
 pub enum Insn {
     // ---- data movement ----
@@ -181,7 +237,7 @@ pub enum Insn {
     /// Load address of a symbol into a register: `lea dst, [rel sym+add]`.
     LeaSym { dst: Reg, sym: usize, add: i64 },
     Push { src: Operand, size: u32 },
-    /// `_` slot in push/pop: `lea rsp, [rsp-8]` (flags untouched, §4.3).
+    /// `_` slot in push/pop: `lea rsp, [rsp ∓ 8]` (flags untouched, §4.3).
     StackSlot { grow: bool },
     Pop { dst: Operand, size: u32 },
     Xchg { a: Operand, b: Operand, size: u32 },
@@ -215,19 +271,13 @@ pub enum Insn {
     // ---- control flow ----
     Jmp { label: usize },
     Jcc { cc: Jcc, label: usize },
-    /// `call` to a symbol; the syscall lowering happens in the backend.
-    Call { sym: usize },
+    /// `call` with its contract summary (§14). The backend lowers syscall
+    /// contracts to `mov rax,N; syscall` inline.
+    Call { sym: usize, contract: CallContract },
     /// Raw `syscall;` instruction (§5.5).
     Syscall,
     Ret,
-    /// x86 `int3` — emitted for `-> !` fallthrough guards (later) and tests.
+    /// `int3` — fallthrough guard for `-> !` and debug traps.
     Int3,
     Nop,
-}
-
-/// Hint attached to an instruction for diagnostics (source span).
-#[derive(Debug, Clone)]
-pub struct Spanned<T> {
-    pub node: T,
-    pub span: Span,
 }
