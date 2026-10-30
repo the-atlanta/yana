@@ -306,3 +306,141 @@ fn nasm_emit_has_labels_and_globals() {
     assert!(src.contains("hello:"), "static label missing:\n{src}");
     assert!(src.contains("lea rsi, [rel hello]"), "{src}");
 }
+
+// ---------------------------------------------------------------------------
+// `align N;` (§4.3 sugar, lowered by the §14.3 stack analysis)
+// ---------------------------------------------------------------------------
+
+/// Resolve + run the analysis pass (which lowers StackAlign → StackPad).
+fn resolve_analyzed(src: &str) -> yana_codegen::Module {
+    let (mut module, diags) = resolve(src);
+    let errs: Vec<_> = diags
+        .iter()
+        .filter(|d| matches!(d.level, yana_ast::DiagLevel::Error))
+        .map(|d| d.message.clone())
+        .collect();
+    assert!(errs.is_empty(), "resolve errors: {errs:?}");
+    yana_analysis::analyze(&mut module);
+    module
+}
+
+const ALIGN_CALLED: &str = r#"
+#[entry]
+fn main() -> ! {
+    call worker {};
+    syscall;
+}
+
+fn worker() -> ! {
+    align 16;
+    syscall;
+}
+"#;
+
+#[test]
+fn align_in_called_function_pads_by_8() {
+    // A function entered via `call` has rsp ≡ 8 (mod 16) → align 16 pads by 8.
+    let module = resolve_analyzed(ALIGN_CALLED);
+    let worker = module
+        .bodies
+        .iter()
+        .find(|b| module.symbols[b.symbol].name == "worker")
+        .expect("worker body");
+    let pads: Vec<u32> = worker
+        .insns
+        .iter()
+        .filter_map(|si| match si.insn {
+            Insn::StackPad { pad } => Some(pad),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(pads, vec![8], "called fn align 16 must pad by 8");
+    // no unlowered StackAlign may survive the analysis pass
+    assert!(
+        !worker.insns.iter().any(|si| matches!(si.insn, Insn::StackAlign { .. })),
+        "StackAlign survived lowering"
+    );
+}
+
+#[test]
+fn align_encodes_to_lea_rsp_matching_nasm() {
+    // The pad becomes `lea rsp,[rsp-8]` (flags untouched) in BOTH backends.
+    let module = resolve_analyzed(ALIGN_CALLED);
+    let enc = yana_back_iced::assemble_text(&module, Some(yana_back_iced::Layout::default_x86_64()))
+        .expect("assemble");
+    let dis = yana_back_iced::disassemble(&enc.text, 0).join("\n");
+    assert!(dis.contains("lea rsp,[rsp-8h]"), "missing lea rsp,[rsp-8h]:\n{dis}");
+
+    let nasm = yana_back_nasm::emit(&module, &[]);
+    assert!(nasm.contains("lea rsp, [rsp-8]"), "nasm missing pad:\n{nasm}");
+}
+
+#[test]
+fn align_at_depth_zero_in_entry_pads_by_zero() {
+    // The process-entry function starts 16-aligned → align 16 pads by 0 →
+    // StackPad{0} encodes to ZERO bytes in both backends.
+    let src = r#"
+#[entry]
+fn main() -> ! {
+    align 16;
+    syscall;
+}
+"#;
+    let module = resolve_analyzed(src);
+    let pads: Vec<u32> = module.bodies[0]
+        .insns
+        .iter()
+        .filter_map(|si| match si.insn {
+            Insn::StackPad { pad } => Some(pad),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(pads, vec![0], "entry fn at depth 0 must pad by 0");
+
+    let enc = yana_back_iced::assemble_text(&module, Some(yana_back_iced::Layout::default_x86_64()))
+        .expect("assemble");
+    let dis = yana_back_iced::disassemble(&enc.text, 0).join("\n");
+    assert!(!dis.contains("lea rsp"), "pad 0 must emit nothing:\n{dis}");
+}
+
+#[test]
+fn align_after_push_realigns() {
+    // push (depth 8) then align 16 in the entry fn → pad 8 → depth 16.
+    let src = r#"
+#[entry]
+fn main() -> ! {
+    push { rbx };
+    align 16;
+    pop { rbx };
+    syscall;
+}
+"#;
+    let module = resolve_analyzed(src);
+    let pads: Vec<u32> = module.bodies[0]
+        .insns
+        .iter()
+        .filter_map(|si| match si.insn {
+            Insn::StackPad { pad } => Some(pad),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(pads, vec![8], "push then align 16 in entry must pad by 8");
+}
+
+#[test]
+fn align_non_power_of_two_is_error() {
+    let src = r#"
+#[entry]
+fn main() -> ! {
+    align 12;
+    syscall;
+}
+"#;
+    let (_, diags) = resolve(src);
+    assert!(
+        diags.iter().any(|d| d.kind == "align-power-of-two"
+            && matches!(d.level, yana_ast::DiagLevel::Error)),
+        "align 12 must be a semantic error: {:?}",
+        diags.iter().map(|d| (&d.kind, &d.level)).collect::<Vec<_>>()
+    );
+}

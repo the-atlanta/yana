@@ -124,13 +124,14 @@ fn resolve(loaded: &Loaded, strict: bool) -> Option<Module> {
     };
     let target = TargetInfo::linux_x86_64();
     let opts = ResolveOptions { strict, ..Default::default() };
-    let out = resolve_module(&file, &target, &opts);
+    let mut out = resolve_module(&file, &target, &opts);
     let had_errors = out.has_errors();
-    diags.extend(out.diagnostics);
+    diags.extend(out.diagnostics.clone());
     if !had_errors {
         // §14 pass 3: flow analysis. Runs always (contract-class diagnostics
-        // are warnings by default, errors under --strict per §11).
-        diags.extend(yana_analysis::analyze(&out.module));
+        // are warnings by default, errors under --strict per §11). Also
+        // lowers `align N;` into concrete StackPad before the backends run.
+        diags.extend(yana_analysis::analyze(&mut out.module));
     }
     let fatal = report::render(&loaded.name, &loaded.source, &diags, strict);
     if fatal > 0 || had_errors {

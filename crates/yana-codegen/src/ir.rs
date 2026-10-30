@@ -14,6 +14,8 @@ use yana_ast::place::SectionKind;
 use yana_ast::reg::Reg;
 use yana_ast::Span;
 
+use crate::target::TargetInfo;
+
 /// A resolved module: symbols + per-function instruction streams + section data.
 #[derive(Debug, Default)]
 pub struct Module {
@@ -25,6 +27,9 @@ pub struct Module {
     pub bodies: Vec<FnBody>,
     /// The `#[entry]` symbol index, if any.
     pub entry: Option<usize>,
+    /// The target this module was resolved for (drives ABI facts like the
+    /// entry-stack offset for `align` lowering, §4.3/§13).
+    pub target: TargetInfo,
 }
 
 impl Module {
@@ -84,7 +89,7 @@ pub enum DataItem {
 }
 
 /// One function's instruction stream.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct FnBody {
     pub symbol: usize,
     /// Instructions with provenance (span + attached trivia comment).
@@ -247,6 +252,13 @@ pub enum Insn {
     Push { src: Operand, size: u32 },
     /// `_` slot in push/pop: `lea rsp, [rsp ∓ 8]` (flags untouched, §4.3).
     StackSlot { grow: bool },
+    /// `align N;` (§4.3): static stack padding, expands to
+    /// `sub rsp, pad` (pad ∈ 0..N) or nothing. Flags untouched.
+    StackAlign { align: u32 },
+    /// Lowered `align N;` — the analysis pass (§14.3) computed the concrete
+    /// pad from the static depth: `lea rsp, [rsp-pad]`, flags untouched.
+    /// pad == 0 encodes to nothing.
+    StackPad { pad: u32 },
     Pop { dst: Operand, size: u32 },
     Xchg { a: Operand, b: Operand, size: u32 },
 

@@ -26,8 +26,8 @@ fn module_of(src: &str) -> yana_codegen::Module {
 }
 
 fn kinds(src: &str) -> Vec<String> {
-    let m = module_of(src);
-    analyze(&m).into_iter().map(|d| d.kind).collect()
+    let mut m = module_of(src);
+    analyze(&mut m).into_iter().map(|d| d.kind).collect()
 }
 
 // ---- stack ----

@@ -284,6 +284,9 @@ pub enum Stmt {
     Push { items: Vec<Place>, span: Span },
     /// `pop { b, a };` (§4.3) — expands in written order.
     Pop { items: Vec<Place>, span: Span },
+    /// `align N;` (§4.3 🟡) — pad the stack so rsp ≡ 0 (mod N) at this point.
+    /// The static depth from the stack analysis decides the padding.
+    Align { align: u64, span: Span },
     /// `branch (cond)? => 'label;` (§4.4).
     Branch {
         cond: Option<BranchCond>,

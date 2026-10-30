@@ -21,9 +21,25 @@ pub struct TargetInfo {
     pub os: Os,
 }
 
+impl Default for TargetInfo {
+    fn default() -> Self {
+        TargetInfo::linux_x86_64()
+    }
+}
+
 impl TargetInfo {
     pub fn linux_x86_64() -> Self {
         TargetInfo { arch: Arch::X86_64, os: Os::Linux }
+    }
+
+    /// rsp modulo the natural stack alignment at function entry, BEFORE any
+    /// of the function's own pushes. SysV x86-64: the `call` pushed the
+    /// return address, so rsp ≡ 8 (mod 16) at entry. AArch64 keeps sp
+    /// 16-aligned at all times and `bl` doesn't touch the stack → 0.
+    pub fn stack_entry_offset(&self) -> i32 {
+        match self.arch {
+            Arch::X86_64 => 8,
+        }
     }
 
     /// `usize`/`isize` width in bits for this target.

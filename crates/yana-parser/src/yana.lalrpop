@@ -553,6 +553,9 @@ Stmt: Stmt = {
         Stmt::Return { value: None, span: Span::new(lo as u32, hi as u32) },
     // raw syscall
     <lo: @L> "syscall" ";" <hi: @R> => Stmt::Syscall { span: Span::new(lo as u32, hi as u32) },
+    // align N;  (§4.3 stack-alignment sugar)
+    <lo: @L> "align" <n: NumSp> ";" <hi: @R> =>
+        Stmt::Align { align: n.max(0) as u64, span: Span::new(lo as u32, hi as u32) },
     // label (name) { ... }
     <lo: @L> "label" "(" <i: IdentSp> ")" <body: Block> <hi: @R> =>
         Stmt::Label { name: i.v, name_span: i.span, body, span: Span::new(lo as u32, hi as u32) },

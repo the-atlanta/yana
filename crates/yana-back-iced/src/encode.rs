@@ -155,10 +155,11 @@ pub fn assemble_text(module: &Module, layout: Option<Layout>) -> Result<EncodedT
         // size this body with dummy encodings
         let mut enc = Encoder::new(64);
         for ins in &body.insns {
-            let i = build_insn(&ins.insn, &sym_vaddrs, layout, base)?;
-            let n = enc.encode(&i, ip).map_err(|e| AsmError::Encode(e.to_string()))?;
-            enc.take_buffer();
-            ip += n as u64;
+            if let Some(i) = build_insn(&ins.insn, &sym_vaddrs, layout, base)? {
+                let n = enc.encode(&i, ip).map_err(|e| AsmError::Encode(e.to_string()))?;
+                enc.take_buffer();
+                ip += n as u64;
+            }
         }
     }
     let text_end = ip;
@@ -190,10 +191,11 @@ pub fn assemble_text(module: &Module, layout: Option<Layout>) -> Result<EncodedT
             let mut enc2 = Encoder::new(64);
             for ins in &body.insns {
                 insn_ips.push(cur);
-                let i = build_insn(&ins.insn, &sym_vaddrs, layout, base)?;
-                let n = enc2.encode(&i, cur).map_err(|e| AsmError::Encode(e.to_string()))?;
-                enc2.take_buffer();
-                cur += n as u64;
+                if let Some(i) = build_insn(&ins.insn, &sym_vaddrs, layout, base)? {
+                    let n = enc2.encode(&i, cur).map_err(|e| AsmError::Encode(e.to_string()))?;
+                    enc2.take_buffer();
+                    cur += n as u64;
+                }
             }
         }
         for def in &body.label_defs {
@@ -203,7 +205,9 @@ pub fn assemble_text(module: &Module, layout: Option<Layout>) -> Result<EncodedT
         }
 
         for (idx, ins) in body.insns.iter().enumerate() {
-            let mut i = build_insn(&ins.insn, &sym_vaddrs, layout, base)?;
+            let Some(mut i) = build_insn(&ins.insn, &sym_vaddrs, layout, base)? else {
+                continue; // zero-byte instruction (lowered `align` with pad 0)
+            };
             // Branch targets are resolved before encoding (rel32 length is
             // value-independent), so the encoder writes the correct field.
             let call_sym = match &ins.insn {
@@ -337,6 +341,19 @@ fn build_insn(
     sym_vaddrs: &HashMap<usize, Option<u64>>,
     layout: Option<Layout>,
     base: u64,
+) -> Result<Option<Instruction>, AsmError> {
+    // A lowered `align` that needs no padding encodes to zero bytes (§4.3).
+    if let Insn::StackPad { pad: 0 } = ins {
+        return Ok(None);
+    }
+    build_insn_inner(ins, sym_vaddrs, layout, base).map(Some)
+}
+
+fn build_insn_inner(
+    ins: &Insn,
+    sym_vaddrs: &HashMap<usize, Option<u64>>,
+    layout: Option<Layout>,
+    base: u64,
 ) -> Result<Instruction, AsmError> {
     let resolve_sym = |sym: usize, add: i64| -> Result<i64, AsmError> {
         match sym_vaddrs.get(&sym).copied().flatten() {
@@ -354,7 +371,9 @@ fn build_insn(
         if rip || m.base == Some(Reg::Rip) {
             Ok(MemoryOperand::new(Register::RIP, Register::None, 1, disp, 4, false, Register::None))
         } else {
-            let disp_size = if disp == 0 && base != Register::None { 0 } else { 4 };
+            // NOTE: in 64-bit addressing iced's displ_size is {0,1,8} — 8 means
+            // disp32 (4 is only valid for 32-bit addressing and errors out).
+            let disp_size = if disp == 0 && base != Register::None { 0 } else { 8 };
             Ok(MemoryOperand::new(base, index, m.scale as u32, disp, disp_size, false, Register::None))
         }
     };
@@ -409,8 +428,28 @@ fn build_insn(
         }
         Insn::StackSlot { grow } => {
             // `_` slot (§4.3): `lea rsp, [rsp ∓ 8]` — flags untouched
+            // (displ_size 8 = disp32 in 64-bit addressing; 4 would be invalid)
             let disp = if *grow { -8i64 } else { 8 };
-            let mo = MemoryOperand::new(Register::RSP, Register::None, 1, disp, 4, false, Register::None);
+            let mo = MemoryOperand::new(Register::RSP, Register::None, 1, disp, 8, false, Register::None);
+            Instruction::with2(Code::Lea_r64_m, Register::RSP, mo).map_err(enc_err)
+        }
+        // `align N;` must be lowered to StackPad by the analysis pass (§14.3)
+        // before codegen — a survivor is a pipeline bug, not a user error.
+        Insn::StackAlign { align } => Err(AsmError::Encode(format!(
+            "unlowered `align {align}` reached the iced backend — run yana_analysis::analyze first"
+        ))),
+        Insn::StackPad { pad } => {
+            // lowered `align N;`: `lea rsp, [rsp-pad]`, flags untouched (§4.3).
+            // pad == 0 is intercepted by the build_insn wrapper (zero bytes).
+            let mo = MemoryOperand::new(
+                Register::RSP,
+                Register::None,
+                1,
+                -(*pad as i64),
+                8, // disp32 in 64-bit addressing (see StackSlot note)
+                false,
+                Register::None,
+            );
             Instruction::with2(Code::Lea_r64_m, Register::RSP, mo).map_err(enc_err)
         }
         Insn::Xchg { a, b, size } => {

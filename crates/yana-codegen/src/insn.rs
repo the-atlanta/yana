@@ -215,6 +215,20 @@ pub fn insn_info(i: &Insn) -> InsnInfo {
             stack_delta: if *grow { -8 } else { 8 },
             ..base
         },
+        // Unlowered `align N;`: the concrete pad isn't known until the stack
+        // analysis rewrites it into StackPad (§4.3 + §14.3). Delta 0 here —
+        // the analysis handles StackAlign specially.
+        Insn::StackAlign { .. } => InsnInfo {
+            reads: vec![r64(GprBase::Sp)],
+            writes: vec![r64(GprBase::Sp)],
+            ..base
+        },
+        Insn::StackPad { pad } => InsnInfo {
+            reads: vec![r64(GprBase::Sp)],
+            writes: vec![r64(GprBase::Sp)],
+            stack_delta: -(*pad as i32),
+            ..base
+        },
         Insn::Xchg { a, b, .. } => {
             let mut reads = operand_reads(a);
             reads.extend(operand_reads(b));

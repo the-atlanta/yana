@@ -150,6 +150,7 @@ impl Resolver {
             diagnostics: Vec::new(),
         };
         r.env_consts_setup();
+        r.module.target = r.target.clone();
         r
     }
 
@@ -721,6 +722,20 @@ impl Resolver {
             Stmt::Syscall { span } => {
                 let _ = span;
                 self.emit(Insn::Syscall);
+            }
+            Stmt::Align { align, span } => {
+                // §4.3 🟡: `align N;` pads rsp to a multiple of N. The pad
+                // depends on the static stack depth, so resolve only records
+                // the intent; the stack analysis (§14.3) lowers it.
+                if *align == 0 || !align.is_power_of_two() {
+                    self.err(
+                        "align-power-of-two",
+                        format!("`align {align}` — alignment must be a power of two ≥ 1"),
+                        *span,
+                    );
+                    return;
+                }
+                self.emit(Insn::StackAlign { align: *align as u32 });
             }
             Stmt::Label { name, name_span, body, span } => {
                 // §6: label = start of block, fallthrough; visible in enclosing
@@ -1603,6 +1618,7 @@ fn stmt_span(s: &Stmt) -> Span {
         | Stmt::DivMod { span, .. }
         | Stmt::Push { span, .. }
         | Stmt::Pop { span, .. }
+        | Stmt::Align { span, .. }
         | Stmt::Branch { span, .. }
         | Stmt::Call { span, .. }
         | Stmt::Return { span, .. }

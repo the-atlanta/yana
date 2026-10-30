@@ -108,7 +108,10 @@ pub fn emit(module: &Module, comments: &[(u32, String)]) -> String {
             if let Some((_, c)) = &si.comment {
                 writeln!(out, "    ;{c}").unwrap();
             }
-            writeln!(out, "    {}", insn_to_nasm(&si.insn, module, &labels)).unwrap();
+            let text = insn_to_nasm(&si.insn, module, &labels);
+            if !text.is_empty() {
+                writeln!(out, "    {text}").unwrap();
+            }
         }
         if let Some(ls) = at.get(&body.insns.len()) {
             for l in ls {
@@ -169,6 +172,20 @@ fn insn_to_nasm(ins: &Insn, module: &Module, labels: &HashMap<usize, String>) ->
                 "lea rsp, [rsp-8]".to_string()
             } else {
                 "lea rsp, [rsp+8]".to_string()
+            }
+        }
+        // `align N;` should have been lowered to StackPad by the analysis pass
+        // (§14.3) before codegen. If one survives, that's a pipeline bug.
+        Insn::StackAlign { align } => {
+            panic!("unlowered `align {align}` reached the NASM backend — run yana_analysis::analyze first")
+        }
+        Insn::StackPad { pad } => {
+            // lowered `align N;`: `lea rsp,[rsp-pad]`, flags untouched (§4.3).
+            // pad == 0 emits nothing — must match the iced backend byte-for-byte.
+            if *pad == 0 {
+                String::new()
+            } else {
+                format!("lea rsp, [rsp-{}]", pad)
             }
         }
         Insn::Xchg { a, b, size } => {

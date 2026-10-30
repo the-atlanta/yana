@@ -24,12 +24,15 @@ use yana_ast::Diagnostic;
 use yana_codegen::Module;
 
 /// Run the full analysis suite over a module (pass 3).
-pub fn analyze(module: &Module) -> Vec<Diagnostic> {
-    let mut diags = Vec::new();
+///
+/// Takes the module mutably: the stack pass lowers `align N;` into concrete
+/// padding (§4.3) before the other checks and the backends ever see it.
+pub fn analyze(module: &mut Module) -> Vec<Diagnostic> {
+    // stack first: lowers aligns, so every later pass sees StackPad
+    let mut diags = stack::lower_and_check(module);
     for body in &module.bodies {
         let graph = cfg::build(module, body);
         diags.extend(scope::check(module, body, &graph));
-        diags.extend(stack::check(module, body, &graph));
         diags.extend(flags::check(module, body, &graph));
         diags.extend(result::check(module, body, &graph));
         diags.extend(liveness::check(module, body, &graph));
