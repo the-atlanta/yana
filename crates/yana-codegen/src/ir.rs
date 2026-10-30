@@ -93,6 +93,14 @@ pub struct FnBody {
     /// Branch instructions and their lexical scope depth (§6: jumping INTO a
     /// nested block is an error; the check compares depths).
     pub branches: Vec<BranchUse>,
+    /// Result registers from the `-> ...` signature (§5.1), normalized to
+    /// 64-bit. Empty for `-> ()`/`-> !`. Analyses use this to know which
+    /// written registers are results, not clobbers, without a call site.
+    pub result_regs: Vec<Reg>,
+    /// Declared `-> !` (§5.1): the function must not return. Falling off the
+    /// end is expected (it should end in a noreturn call/syscall), so the
+    /// fallthrough check is suppressed and a reachable plain `ret` is flagged.
+    pub returns_never: bool,
 }
 
 /// An instruction plus its source span and trivia comment (§14: "спаны и

@@ -5,6 +5,7 @@ members = [
     "crates/yana-lexer",
     "crates/yana-parser",
     "crates/yana-codegen",
+    "crates/yana-analysis",
     "crates/yana-back-iced",
     "crates/yana-back-nasm",
     "crates/yana-cli",
@@ -23,6 +24,7 @@ yana-ast = { path = "crates/yana-ast" }
 yana-lexer = { path = "crates/yana-lexer" }
 yana-parser = { path = "crates/yana-parser" }
 yana-codegen = { path = "crates/yana-codegen" }
+yana-analysis = { path = "crates/yana-analysis" }
 yana-back-iced = { path = "crates/yana-back-iced" }
 yana-back-nasm = { path = "crates/yana-back-nasm" }
 

@@ -1,0 +1,13 @@
+[package]
+name = "yana-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+yana-ast = { workspace = true }
+yana-codegen = { workspace = true }
+
+[dev-dependencies]
+yana-parser = { workspace = true }

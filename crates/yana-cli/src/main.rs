@@ -127,6 +127,11 @@ fn resolve(loaded: &Loaded, strict: bool) -> Option<Module> {
     let out = resolve_module(&file, &target, &opts);
     let had_errors = out.has_errors();
     diags.extend(out.diagnostics);
+    if !had_errors {
+        // §14 pass 3: flow analysis. Runs always (contract-class diagnostics
+        // are warnings by default, errors under --strict per §11).
+        diags.extend(yana_analysis::analyze(&out.module));
+    }
     let fatal = report::render(&loaded.name, &loaded.source, &diags, strict);
     if fatal > 0 || had_errors {
         return None;

@@ -10,6 +10,7 @@ yana-ast = { workspace = true }
 yana-lexer = { workspace = true }
 yana-parser = { workspace = true }
 yana-codegen = { workspace = true }
+yana-analysis = { workspace = true }
 yana-back-iced = { workspace = true }
 yana-back-nasm = { workspace = true }
 clap = { workspace = true }

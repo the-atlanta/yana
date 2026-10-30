@@ -489,7 +489,16 @@ impl Resolver {
             None => return, // dup-symbol already reported
         };
         // fresh per-function state
-        self.body = FnBody { symbol: info.sym, insns: Vec::new(), label_defs: Vec::new(), branches: Vec::new() };
+        let result_regs = ret_result_regs(&f.sig.ret);
+        let returns_never = matches!(f.sig.ret, RetSig::Never { .. });
+        self.body = FnBody {
+            symbol: info.sym,
+            insns: Vec::new(),
+            label_defs: Vec::new(),
+            branches: Vec::new(),
+            result_regs,
+            returns_never,
+        };
         self.labels.clear();
         self.pending_jumps.clear();
         self.scopes.clear();
@@ -1605,6 +1614,30 @@ fn stmt_span(s: &Stmt) -> Span {
 
 fn has_pub(attrs: &[yana_ast::Attr]) -> bool {
     attrs.iter().any(|a| a.has_name("pub") || a.has_name("global"))
+}
+
+/// Result registers (normalized to 64-bit) declared by a return signature
+/// (§5.1). `-> ()` and `-> !` yield none.
+fn ret_result_regs(ret: &RetSig) -> Vec<Reg> {
+    use yana_ast::reg::RegSize;
+    fn norm(r: &Reg) -> Reg {
+        r.resize(RegSize::R64).unwrap_or(*r)
+    }
+    match ret {
+        RetSig::None | RetSig::Never { .. } => Vec::new(),
+        RetSig::Single { place, .. } => match place {
+            Place::Reg { reg, .. } => vec![norm(reg)],
+            Place::RegPair { hi, lo, .. } => vec![norm(hi), norm(lo)],
+            _ => Vec::new(),
+        },
+        RetSig::Tuple { parts, .. } => parts
+            .iter()
+            .filter_map(|p| match &p.place {
+                Place::Reg { reg, .. } => Some(norm(reg)),
+                _ => None,
+            })
+            .collect(),
+    }
 }
 
 /// Compare two places ignoring type annotations (a signature place carries
