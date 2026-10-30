@@ -16,7 +16,7 @@ pub struct Item {
 
 /// Language keywords with spec references.
 pub fn keywords() -> Vec<Item> {
-    vec![
+    let mut v = vec![
         Item { label: "bind", detail: "привязка места (§3)", docs: "bind [mut] имя @ место: тип [= значение];", insert: Some("bind ${1:mut }${2:name} @ ${3:rax}: ${4:u64} = ${5:0};") },
         Item { label: "alt", detail: "запись в место (§4.2)", docs: "alt требует mut-привязки; не нужна для bind-инициализации и команд (pop/call/syscall/return).", insert: Some("alt ${1:dst} ${2:=} ${3:src};") },
         Item { label: "push", detail: "в стек, порядок написания (§4.3)", docs: "push { a, b }; — раскрывается в написанном порядке; `_` = пустой слот 8 байт (lea rsp).", insert: Some("push { ${1:rbx} };") },
@@ -36,7 +36,14 @@ pub fn keywords() -> Vec<Item> {
         Item { label: "false", detail: "булево (const-выражения)", docs: "", insert: None },
         Item { label: "if", detail: "if-выражение (§8)", docs: "Только в const-контексте: if cond { a } else { b }", insert: Some("if ${1:cond} { ${2:a} } else { ${3:b} }") },
         Item { label: "else", detail: "ветка if-выражения (§8)", docs: "", insert: None },
-    ]
+        Item { label: "let", detail: "зарезервировано (§1)", docs: "", insert: None },
+        Item { label: "macro", detail: "макрос (§9)", docs: "macro имя(a: вид, ...) { тело }; вызов позиционный имя!(a, b) и именованный имя! { a: x, b: y }. Виды фрагментов: place, value, label, type, ident, block. Гигиена: метки и bind внутри макроса получают уникальные имена; раскрытие чистой подстановкой без вычислений.", insert: Some("macro ${1:name}(${2:a}: ${3:place}) {\n    $0\n}") },
+        Item { label: "macro_rules", detail: "макрос с правилами (§9)", docs: "macro_rules! имя { (шаблон) => { тело }; ... } с повторениями $(...),* и $(...),+. Фрагменты $x:place, $x:value, ...; рекурсия с лимитом глубины 64.", insert: Some("macro_rules! ${1:name} { ($${2:pattern}) => { ${3:body} }; }") },
+    ];
+    // `macro`/`macro_rules` are §9 keywords now (not reserved) — the
+    // reserved() list below is a separate table.
+    v.push(Item { label: "align", detail: "выравнивание стека (§4.3)", docs: "align N; — паддинг до кратности N (lea rsp, флаги не трогаются).", insert: Some("align ${1:16};") });
+    v
 }
 
 /// Reserved words (§1) — completing them warns they're future syntax.

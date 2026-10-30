@@ -142,6 +142,11 @@ pub enum Token {
     #[token("]")] RBracket,
     #[token("#")] Hash,
 
+    /// `$` — macro_rules metavariable marker (§9). Never reaches the LALRPOP
+    /// grammar: the macro pre-pass consumes it at token-tree level.
+    #[token("$")]
+    Dollar,
+
     /// `'label` reference (§1) — quote + identifier, no closing quote.
     #[regex(r"'[A-Za-z_][A-Za-z0-9_]*", label_callback)]
     LabelRef(String),
