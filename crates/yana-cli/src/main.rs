@@ -49,7 +49,13 @@ enum Cmd {
         strict: bool,
     },
     /// Print the resolved IR, one instruction per line (§14 pass 2)
-    Expand { file: PathBuf },
+    Expand {
+        file: PathBuf,
+        /// Print the post-expansion token stream instead of the IR (§9):
+        /// one token per line, comments included.
+        #[arg(long)]
+        macros: bool,
+    },
     /// Emit NASM assembly text (§13: comments preserved)
     Nasm {
         file: PathBuf,
@@ -74,7 +80,7 @@ fn main() {
     let code = match cli.cmd {
         Cmd::Build { file, out, backend, object, strict } => cmd_build(&file, out, backend, object, strict),
         Cmd::Run { file, strict } => cmd_run(&file, strict),
-        Cmd::Expand { file } => cmd_expand(&file),
+        Cmd::Expand { file, macros } => cmd_expand(&file, macros),
         Cmd::Nasm { file, out, assemble } => cmd_nasm(&file, out, assemble),
         Cmd::Oracle { file } => cmd_oracle(&file),
     };
@@ -234,11 +240,63 @@ fn cmd_run(path: &Path, strict: bool) -> i32 {
     code
 }
 
-fn cmd_expand(path: &Path) -> i32 {
+fn cmd_expand(path: &Path, macros: bool) -> i32 {
+    if macros {
+        // §9: dump the post-expansion token stream (pass 0.5 output),
+        // one token per line: `lo..hi\tTokenKind\ttext`, comments included.
+        let Ok(source) = std::fs::read_to_string(path) else {
+            return fail(&format!("cannot read {}", path.display()));
+        };
+        let parsed = yana_parser::parse(&source);
+        // Re-run the pipeline pieces lex→triples→expand to get the stream;
+        // parse() already did this, so re-derive for printing.
+        let lexed = yana_lexer::lex(&source);
+        let triples = yana_lexer::token_triples(&lexed);
+        let expanded = yana_parser::macros::expand(triples);
+        let mut comments = parsed.comments.clone();
+        comments.sort_by_key(|(off, _)| *off);
+        // Interleave tokens and comments by byte offset.
+        let mut rows: Vec<(u32, bool, String)> = Vec::new();
+        for (lo, tok, hi) in &expanded.triples {
+            let (kind, text) = token_display(tok);
+            rows.push((*lo as u32, false, format!("{}\t{}\t{}", kind, text, hi)));
+        }
+        for (off, c) in &comments {
+            rows.push((*off, true, format!("comment\t{c}")));
+        }
+        rows.sort_by_key(|(off, is_comment, _)| (*off, !*is_comment));
+        for (_, _, line) in rows {
+            println!("{line}");
+        }
+        if parsed.has_errors() {
+            report::render(
+                &path.display().to_string(),
+                &source,
+                &parsed.diagnostics,
+                false,
+            );
+            return 1;
+        }
+        return 0;
+    }
     let Some(loaded) = load(path) else { return 2 };
     let Some(module) = resolve(&loaded, false) else { return 1 };
     print!("{}", yana_back_nasm::expand_ir(&module));
     0
+}
+
+/// Render a token for the `--macros` dump: (kind, text).
+fn token_display(tok: &yana_lexer::Token) -> (String, String) {
+    use yana_lexer::Token;
+    match tok {
+        Token::Ident(s) => ("ident".into(), s.clone()),
+        Token::Num(s) => ("num".into(), s.clone()),
+        Token::Str(s) => ("str".into(), s.clone()),
+        Token::LabelRef(s) => ("lbl".into(), format!("'{s}")),
+        Token::Char(c) => ("char".into(), format!("'{}'", *c as char)),
+        Token::PairReg((hi, lo, ..)) => ("pair".into(), format!("{}:{}", hi.name(), lo.name())),
+        other => (format!("{other:?}"), String::new()),
+    }
 }
 
 fn cmd_nasm(path: &Path, out: Option<PathBuf>, assemble: bool) -> i32 {

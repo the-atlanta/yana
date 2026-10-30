@@ -10,6 +10,8 @@ use yana_ast::{Diagnostic, DiagCode, File, Span};
 use yana_lexer::Token;
 
 pub mod gram;
+pub mod macros;
+pub use macros::ExpandResult;
 
 lalrpop_mod!(
     #[allow(clippy::all)]
@@ -54,20 +56,34 @@ pub fn parse(source: &str) -> ParseOutput {
     }
 
     let triples = yana_lexer::token_triples(&lexed);
+
+    // §14 pass 0.5: macro expansion (§9). Token-level pre-pass, after lexing
+    // (and after the PairReg collapse), before the LALRPOP parser — by parse
+    // time all macro declarations and invocations are gone from the stream,
+    // so the grammar stays macro-free (see docs/NOTES-macros.md).
+    let macro_out = macros::expand(triples);
+    diagnostics.extend(macro_out.diagnostics);
+
+    // Merge the expansion comments (§9.7: every expansion is signed) into the
+    // trivia channel, keeping byte-offset order.
+    let mut comments = lexed.comments;
+    comments.extend(macro_out.comments);
+    comments.sort_by_key(|(off, _)| *off);
+
     let parser = yana::FileParser::new();
 
-    match parser.parse(triples) {
+    match parser.parse(macro_out.triples) {
         Ok(file) => ParseOutput {
             file: Some(file),
             diagnostics,
-            comments: lexed.comments,
+            comments,
         },
         Err(err) => {
             diagnostics.push(parse_error_to_diag(err));
             ParseOutput {
                 file: None,
                 diagnostics,
-                comments: lexed.comments,
+                comments,
             }
         }
     }

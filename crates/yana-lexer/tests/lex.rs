@@ -30,10 +30,20 @@ fn lexes_numbers_and_escapes() {
 
 #[test]
 fn bad_byte_recorded_not_fatal() {
-    let out = lex("bind x @ rax: u64 = $;");
+    // `$` is now a token (§9 macro_rules metavariables), so use a truly
+    // invalid byte: `?`.
+    let out = lex("bind x @ rax: u64 = ?;");
     assert_eq!(out.errors.len(), 1);
     // still produced tokens around it
     assert!(out.tokens.iter().any(|t| matches!(t.kind, Token::Semi)));
+}
+
+#[test]
+fn dollar_is_a_token() {
+    // `$name:kind` fragments (§9) lex as Dollar + Ident + Colon + Ident.
+    let out = lex("macro_rules! m { ($x:place) => { alt $x = 1; } }");
+    assert!(out.errors.is_empty(), "lex errors: {:?}", out.errors);
+    assert!(out.tokens.iter().any(|t| matches!(t.kind, Token::Dollar)));
 }
 
 #[test]
