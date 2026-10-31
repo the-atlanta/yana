@@ -849,8 +849,8 @@ fn sanitize(name: &str) -> String {
     name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect()
 }
 
-struct Z3 {
-    bin: String,
+pub struct Z3 {
+    pub bin: String,
 }
 
 impl Z3 {
@@ -1138,9 +1138,14 @@ impl<'a> Visitor<'a> {
 
 /// Run pass 4 over a resolved module. Read-only: the IR is never rewritten.
 pub fn verify(module: &Module) -> Vec<Diagnostic> {
+    verify_with(module, Z3::find())
+}
+
+/// [`verify`] with an explicit z3 handle (`None` = SMT unavailable: contract
+/// checks warn once with `verify-smt-unavailable` and are skipped).
+pub fn verify_with(module: &Module, z3: Option<Z3>) -> Vec<Diagnostic> {
     let statics = static_facts(module);
     let ctx = Ctx { module, statics: &statics };
-    let z3 = Z3::find();
     let mut diags: Vec<Diagnostic> = Vec::new();
     let mut smt_warned_global = false;
 
@@ -1478,5 +1483,206 @@ fn main() -> ! {
         assert_eq!(extract_value(text, "v_n").unwrap(), "0");
         assert_eq!(extract_value(text, "v_rax").unwrap(), "(- 5)");
         assert!(extract_value(text, "v_missing").is_none());
+    }
+
+    // ---- contract integration (z3 required; skipped when unavailable) ----
+
+    /// Resolve + run pass 4. Returns None (test skips) when z3 is missing.
+    fn verify_z3(src: &str) -> Option<Vec<Diagnostic>> {
+        let z3 = Z3::find()?;
+        Some(verify_with(&module_of(src), Some(z3)))
+    }
+
+    fn assert_z3(diags: Option<Vec<Diagnostic>>) -> Vec<Diagnostic> {
+        match diags {
+            Some(d) => d,
+            None => {
+                eprintln!("z3 not available — contract integration test skipped");
+                Vec::new()
+            }
+        }
+    }
+
+    #[test]
+    fn requires_violated_by_imm_zero_arg() {
+        let diags = assert_z3(verify_z3(
+            r#"
+fn f(n @ rdi: u64) -> rax: u64
+requires n > 0;
+{
+    alt rax = 1;
+    return;
+}
+
+#[entry]
+fn main() -> ! {
+    bind r = call f { n: 0 };
+    syscall;
+}
+"#,
+        ));
+        let d = diags
+            .iter()
+            .find(|d| d.kind == "verify-requires")
+            .expect("verify-requires diagnostic");
+        assert!(matches!(d.level, DiagLevel::Error));
+        assert!(matches!(d.code, DiagCode::Contract));
+        assert!(d.message.contains('f'), "{}", d.message);
+        // the counterexample model names the offending parameter
+        assert!(d.message.contains("n = 0"), "{}", d.message);
+    }
+
+    #[test]
+    fn requires_proven_by_nonzero_arg() {
+        let diags = assert_z3(verify_z3(
+            r#"
+fn f(n @ rdi: u64) -> rax: u64
+requires n > 0;
+{
+    alt rax = 1;
+    return;
+}
+
+#[entry]
+fn main() -> ! {
+    bind r = call f { n: 5 };
+    syscall;
+}
+"#,
+        ));
+        assert!(
+            !kinds(&diags).contains(&"verify-requires"),
+            "{:?}",
+            kinds(&diags)
+        );
+    }
+
+    #[test]
+    fn requires_proven_by_interval_not_point() {
+        // the arg register carries a computed interval [7,7] → n > 0 holds
+        let diags = assert_z3(verify_z3(
+            r#"
+fn f(n @ rdi: u64) -> rax: u64
+requires n > 0;
+{
+    alt rax = 1;
+    return;
+}
+
+#[entry]
+fn main() -> ! {
+    bind mut x @ rbx: u64 = 3;
+    alt x += 4;
+    bind r = call f { n: x };
+    syscall;
+}
+"#,
+        ));
+        assert!(
+            !kinds(&diags).contains(&"verify-requires"),
+            "{:?}",
+            kinds(&diags)
+        );
+    }
+
+    #[test]
+    fn requires_violated_by_interval_incl_zero() {
+        // the entry parameter y is unconstrained; x = y or 0 depending on the
+        // branch → at the join x spans a true interval including 0 →
+        // `requires x >= 5` is unprovable
+        let diags = assert_z3(verify_z3(
+            r#"
+fn f(n @ rdi: u64) -> rax: u64
+requires n >= 5;
+{
+    alt rax = 1;
+    return;
+}
+
+#[entry]
+fn main(y @ rsi: u64) -> ! {
+    bind mut x @ rbx: u64 = 0;
+    branch (y == 0) => 'iszero;
+    alt x = y;
+    branch => 'docall;
+    label (iszero) { alt x = 0; }
+    label (docall) {
+        bind r = call f { n: x };
+        syscall;
+    }
+}
+"#,
+        ));
+        assert!(
+            kinds(&diags).contains(&"verify-requires"),
+            "{:?}",
+            diags.iter().map(|d| (&d.kind, &d.message)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ensures_satisfied_no_error() {
+        let diags = assert_z3(verify_z3(
+            r#"
+fn f(n @ rdi: u64) -> rax: u64
+ensures rax >= 100;
+{
+    alt rax = 100;
+    return;
+}
+"#,
+        ));
+        assert!(
+            !kinds(&diags).contains(&"verify-ensures"),
+            "{:?}",
+            kinds(&diags)
+        );
+    }
+
+    #[test]
+    fn ensures_violated_with_model() {
+        let diags = assert_z3(verify_z3(
+            r#"
+fn f(n @ rdi: u64) -> rax: u64
+ensures rax >= 100;
+{
+    alt rax = 50;
+    return;
+}
+"#,
+        ));
+        let d = diags
+            .iter()
+            .find(|d| d.kind == "verify-ensures")
+            .expect("verify-ensures diagnostic");
+        assert!(matches!(d.level, DiagLevel::Error));
+        assert!(d.message.contains("rax = 50"), "{}", d.message);
+    }
+
+    #[test]
+    fn smt_unavailable_warns_once_and_skips() {
+        // no z3 → contract checks skipped with exactly one warning; the
+        // div-zero interval check still runs (it needs no SMT)
+        let m = module_of(
+            r#"
+fn f(n @ rdi: u64) -> rax: u64
+requires n > 0;
+{
+    alt rax = 1;
+    return;
+}
+
+#[entry]
+fn main() -> ! {
+    bind r = call f { n: 0 };
+    syscall;
+}
+"#,
+        );
+        let diags = verify_with(&m, None);
+        let warns: Vec<_> = diags.iter().filter(|d| d.kind == "verify-smt-unavailable").collect();
+        assert_eq!(warns.len(), 1, "{:?}", kinds(&diags));
+        assert!(matches!(warns[0].level, DiagLevel::Warning));
+        assert_eq!(verify_errors(&diags), 0, "{:?}", kinds(&diags));
     }
 }
