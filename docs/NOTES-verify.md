@@ -181,6 +181,46 @@ pass 4 catches the flow-dependent cases.
 - D8: ensures at fall-through end checked only when !returns_never and the
   end is reachable (last block has fallthrough — cfg models it; simply:
   state at end of last insn index if reachable in fixed-point).
+- D9: bitwise ConstExpr ops (`&`, `|`, `^`) have NO QF_NIA encoding (SMT
+  Ints are unbounded integers, not bitvectors). smt_of returns None for
+  them → the affected clause is skipped with a `verify-contract-expr`
+  WARNING (not an error — it's a limitation, not a violation). Shifts by a
+  CONST operand DO encode (shl→×2^k, shr→div 2^k); shifts by a variable
+  return None. Keep contract expressions to + - * / % comparisons && ||
+  and unary -/! on parameters/results.
+- D10: the contract VISITOR runs on the PRE-instruction state (visit before
+  xfer in walk_block). A Call kills all caller-saved regs — visiting after
+  the transfer would erase exactly the actual-argument interval facts the
+  call-site `requires` check needs. Ret visits the state at the return point
+  (rax holds the result there), which is correct for `ensures`.
+
+## Status (attempt #6 — COMPLETE)
+
+Milestones 1–7 all done and committed on feat/verify:
+- 4 (9c96c6d): wired `pub mod verify;`, fixed compile errors (SpannedInsn
+  is in yana_codegen::ir; Operand::Imm not a dst; Option<&mut> borrows not
+  moves; clone taken-edge state), visit-before-xfer fix, extract_value
+  balanced-paren scan for negative z3 models ((- 5)); 10 unit tests
+  (interval arithmetic corners + i128 saturation + BOTTOM; hull/intersect/
+  exclude_point; div-zero detected, NOT flagged when guarded / const-folded
+  / arith-derived; widening fixed point terminates on a loop; smt_of shapes).
+- 5 (57bc999): verify_with(module, z3) split + 8 z3-gated contract
+  integration tests (requires violated by imm 0 with counterexample model,
+  proven by imm/interval, unprovable via a branch-join interval; ensures
+  satisfied vs violated; verify-smt-unavailable warns once, skips, never
+  fails). Label pitfall: `call`/`zero` are keywords — test labels renamed.
+- 6 (b5e64fa): `yana verify <file>` subcommand (resolve w/o pass 3 per D3 →
+  verify → render → exit=error count) + `build --verify` (pass 4 after
+  analyze; errors fail the build, single-file AND §10 multi-module via
+  loader_verify). tests/verify_e2e.rs: 7 e2e tests.
+- 7 (97fec70): knowledge.rs requires/ensures promoted reserved()→keywords()
+  with completion snippets + hover; examples/verify.yana demo.
+
+Gates (all green, ukko, z3 5.3.3): workspace tests 144 pass (111 master +
+25 new + 8 pre-existing on branch); oracle MATCH on hello/factorial/atomics
+/verify (8/10/7/18 insns); hello prints "Hello, YANA!"; factorial exits
+120; atomics exits 12; verify.yana verifies clean (exit 0) and runs (exit
+100). LSP smoke PASS (completion+hover intact).
 
 ## Gates
 
