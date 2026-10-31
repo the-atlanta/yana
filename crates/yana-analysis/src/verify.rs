@@ -248,9 +248,9 @@ fn static_facts(module: &Module) -> HashMap<usize, i128> {
     out
 }
 
-struct Ctx<'a> {
-    module: &'a Module,
-    statics: &'a HashMap<usize, i128>,
+/// Verifier context: static memory facts keyed by symbol index (D2).
+pub struct Ctx<'a> {
+    pub statics: &'a HashMap<usize, i128>,
 }
 
 /// Value of an operand under the state.
@@ -883,9 +883,8 @@ impl Z3 {
             .ok()?;
         child.stdin.take()?.write_all(script.as_bytes()).ok()?;
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut wait_child = child;
         std::thread::spawn(move || {
-            let out = wait_child.wait_with_output();
+            let out = child.wait_with_output();
             let _ = tx.send(out);
         });
         let out = rx.recv_timeout(Duration::from_secs(5)).ok()?.ok()?;
@@ -944,10 +943,6 @@ struct Visitor<'a> {
 }
 
 impl<'a> Visitor<'a> {
-    fn var_list(names: impl Iterator<Item = String>) -> Vec<String> {
-        names.map(|n| format!("v_{}", sanitize(&n))).collect()
-    }
-
     fn interval_assert(name: &str, iv: Ival) -> Option<String> {
         if iv.is_top() || iv.is_bottom() {
             return None; // TOP: unconstrained. BOTTOM: unreachable — skip.
@@ -1145,7 +1140,7 @@ pub fn verify(module: &Module) -> Vec<Diagnostic> {
 /// checks warn once with `verify-smt-unavailable` and are skipped).
 pub fn verify_with(module: &Module, z3: Option<Z3>) -> Vec<Diagnostic> {
     let statics = static_facts(module);
-    let ctx = Ctx { module, statics: &statics };
+    let ctx = Ctx { statics: &statics };
     let mut diags: Vec<Diagnostic> = Vec::new();
     let mut smt_warned_global = false;
 
@@ -1387,7 +1382,7 @@ fn main() -> ! {
         let body = &m.bodies[0];
         let graph = cfg::build(&m, body);
         let statics = static_facts(&m);
-        let ctx = Ctx { module: &m, statics: &statics };
+        let ctx = Ctx { statics: &statics };
         let entries = entry_states(body, &graph, &ctx);
         // every block got an entry state (reachable) and widening converged
         assert_eq!(entries.len(), graph.blocks.len());

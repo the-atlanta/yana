@@ -1,0 +1,14 @@
+
+fn f(n @ rdi: u64) -> rax: u64
+requires n > 0;
+ensures rax >= 100;
+{
+    alt rax = 100;
+    return;
+}
+
+#[entry]
+fn main() -> ! {
+    bind r = call f { n: 7 };
+    syscall;
+}

@@ -49,6 +49,10 @@ enum Cmd {
         /// `contract` warnings become errors (§11)
         #[arg(long)]
         strict: bool,
+        /// §14 pass 4: interval analysis + contracts before building;
+        /// verify errors fail the build
+        #[arg(long)]
+        verify: bool,
     },
     /// Compile and run (iced backend, static executable)
     Run {
@@ -75,6 +79,9 @@ enum Cmd {
     },
     /// Build with both backends and compare the disassembly (test oracle)
     Oracle { file: PathBuf },
+    /// §14 pass 4: verify (interval analysis + `requires`/`ensures` via z3);
+    /// exit code = number of verify errors
+    Verify { file: PathBuf },
 }
 
 #[derive(ValueEnum, Clone, Copy, PartialEq, Eq)]
@@ -92,11 +99,12 @@ where
 {
     let cli = Cli::parse_from(args);
     match cli.cmd {
-        Cmd::Build { file, out, backend, object, strict } => cmd_build(&file, out, backend, object, strict),
+        Cmd::Build { file, out, backend, object, strict, verify } => cmd_build(&file, out, backend, object, strict, verify),
         Cmd::Run { file, strict } => cmd_run(&file, strict),
         Cmd::Expand { file, macros } => cmd_expand(&file, macros),
         Cmd::Nasm { file, out, assemble } => cmd_nasm(&file, out, assemble),
         Cmd::Oracle { file } => cmd_oracle(&file),
+        Cmd::Verify { file } => cmd_verify(&file),
     }
 }
 
@@ -136,7 +144,8 @@ fn load(path: &Path) -> Option<Loaded> {
 }
 
 /// Parse + resolve, rendering diagnostics. Returns None on any fatal error.
-fn resolve(loaded: &Loaded, strict: bool) -> Option<Module> {
+/// `verify` additionally runs §14 pass 4 after pass 3 (`build --verify`).
+fn resolve_ex(loaded: &Loaded, strict: bool, verify: bool) -> Option<Module> {
     let parsed = yana_parser::parse(&loaded.source);
     let mut diags = parsed.diagnostics.clone();
     let file = match parsed.file {
@@ -156,8 +165,43 @@ fn resolve(loaded: &Loaded, strict: bool) -> Option<Module> {
         // are warnings by default, errors under --strict per §11). Also
         // lowers `align N;` into concrete StackPad before the backends run.
         diags.extend(yana_analysis::analyze(&mut out.module));
+        if verify {
+            // §14 pass 4: read-only interval + contract verification. Errors
+            // fail the build (the caller counts fatals below).
+            diags.extend(yana_analysis::verify::verify(&out.module));
+        }
     }
     let fatal = report::render(&loaded.name, &loaded.source, &diags, strict);
+    if fatal > 0 || had_errors {
+        return None;
+    }
+    Some(out.module)
+}
+
+/// Parse + resolve, rendering diagnostics. Returns None on any fatal error.
+fn resolve(loaded: &Loaded, strict: bool) -> Option<Module> {
+    resolve_ex(loaded, strict, false)
+}
+
+/// Resolve WITHOUT pass 3 (`yana verify`, NOTES-verify D3: pass 4 stays
+/// read-only, so no `analyze()` — Call clobbers are handled conservatively
+/// inside the verifier itself). Returns None on any fatal resolve error.
+fn resolve_for_verify(loaded: &Loaded) -> Option<Module> {
+    let parsed = yana_parser::parse(&loaded.source);
+    let mut diags = parsed.diagnostics.clone();
+    let file = match parsed.file {
+        Some(f) => f,
+        None => {
+            report::render(&loaded.name, &loaded.source, &diags, false);
+            return None;
+        }
+    };
+    let target = TargetInfo::linux_x86_64();
+    let opts = ResolveOptions { strict: false, ..Default::default() };
+    let out = resolve_module(&file, &target, &opts);
+    let had_errors = out.has_errors();
+    diags.extend(out.diagnostics.clone());
+    let fatal = report::render(&loaded.name, &loaded.source, &diags, false);
     if fatal > 0 || had_errors {
         return None;
     }
@@ -168,14 +212,29 @@ fn resolve(loaded: &Loaded, strict: bool) -> Option<Module> {
 // §10 multi-module pipeline
 // ---------------------------------------------------------------------------
 
+/// Run §14 pass 4 over every loaded module, render its diagnostics against
+/// each module's own source, and return the fatal (error) count.
+fn loader_verify(loader: &mut Loader, strict: bool) -> usize {
+    let mut fatal = 0;
+    for m in &loader.mods {
+        let diags = yana_analysis::verify::verify(&m.module);
+        let name = m.path.display().to_string();
+        fatal += report::render(&name, &m.source, &diags, strict);
+    }
+    fatal
+}
+
 /// `--object` for a file with `use` items: resolve the module graph (imports
 /// come from the used modules) but emit only ONE .o for the given file —
 /// §10 "one source file = one object file". The imports remain undefined
 /// (SHN_UNDEF) for the user's own link step.
-fn build_single_object(path: &Path, strict: bool, out: &Path) -> Result<Option<usize>, String> {
+fn build_single_object(path: &Path, strict: bool, out: &Path, verify: bool) -> Result<Option<usize>, String> {
     let mut loader = Loader::new();
     loader.load(path, strict)?;
     if loader.render(strict) > 0 || loader.has_fatal(strict) {
+        return Ok(None);
+    }
+    if verify && loader_verify(&mut loader, strict) != 0 {
         return Ok(None);
     }
     let Some(root) = loader.mods.last() else { return Ok(None) };
@@ -191,11 +250,14 @@ fn build_single_object(path: &Path, strict: bool, out: &Path) -> Result<Option<u
 ///
 /// Returns Ok(Some(exe)) on success; Ok(None) when diagnostics were rendered
 /// and the build should stop; Err(msg) for environment problems (missing ld).
-fn build_multi(path: &Path, strict: bool, exe: &Path) -> Result<Option<Vec<u8>>, String> {
+fn build_multi(path: &Path, strict: bool, exe: &Path, verify: bool) -> Result<Option<Vec<u8>>, String> {
     let mut loader = Loader::new();
     loader.load(path, strict)?;
 
     if loader.render(strict) > 0 || loader.has_fatal(strict) {
+        return Ok(None);
+    }
+    if verify && loader_verify(&mut loader, strict) != 0 {
         return Ok(None);
     }
     let mods = &loader.mods;
@@ -255,7 +317,7 @@ fn build_multi(path: &Path, strict: bool, exe: &Path) -> Result<Option<Vec<u8>>,
 // subcommands
 // ---------------------------------------------------------------------------
 
-fn cmd_build(path: &Path, out: Option<PathBuf>, backend: BackendArg, object: bool, strict: bool) -> i32 {
+fn cmd_build(path: &Path, out: Option<PathBuf>, backend: BackendArg, object: bool, strict: bool, verify: bool) -> i32 {
     // §10: auto-discover `use` dependencies; single-file behavior is
     // unchanged when the file has no `use` items.
     let has_uses = std::fs::read_to_string(path)
@@ -272,7 +334,7 @@ fn cmd_build(path: &Path, out: Option<PathBuf>, backend: BackendArg, object: boo
         if object {
             // §10: one object file per source file — emit only the given
             // file's .o (imports stay undefined; the user links them).
-            return match build_single_object(path, strict, &out) {
+            return match build_single_object(path, strict, &out, verify) {
                 Ok(Some(n)) => {
                     eprintln!("yana: wrote {} ({} bytes)", out.display(), n);
                     0
@@ -281,7 +343,7 @@ fn cmd_build(path: &Path, out: Option<PathBuf>, backend: BackendArg, object: boo
                 Err(e) => fail(&e),
             };
         }
-        return match build_multi(path, strict, &out) {
+        return match build_multi(path, strict, &out, verify) {
             Ok(Some(_)) => {
                 if let Err(e) = set_executable(&out) {
                     return fail(&e);
@@ -294,7 +356,7 @@ fn cmd_build(path: &Path, out: Option<PathBuf>, backend: BackendArg, object: boo
     }
 
     let Some(loaded) = load(path) else { return 2 };
-    let Some(module) = resolve(&loaded, strict) else { return 1 };
+    let Some(module) = resolve_ex(&loaded, strict, verify) else { return 1 };
     let out = out.unwrap_or_else(|| default_out(path, backend, object));
 
     match backend {
@@ -371,7 +433,7 @@ fn cmd_run(path: &Path, strict: bool) -> i32 {
             .unwrap_or(0)
     ));
     let exe_bytes: Vec<u8> = if has_uses {
-        match build_multi(path, strict, &tmp) {
+        match build_multi(path, strict, &tmp, false) {
             Ok(Some(b)) => b,
             Ok(None) => return 1,
             Err(e) => return fail(&e),
@@ -405,6 +467,24 @@ fn cmd_run(path: &Path, strict: bool) -> i32 {
     };
     let _ = std::fs::remove_file(&tmp);
     code
+}
+
+/// §14 pass 4: `yana verify <file>` — resolve (without pass 3, D3) →
+/// interval analysis + contract checks → render → exit = error count.
+fn cmd_verify(path: &Path) -> i32 {
+    let Some(loaded) = load(path) else { return 2 };
+    let Some(module) = resolve_for_verify(&loaded) else { return 1 };
+    let diags = yana_analysis::verify::verify(&module);
+    let fatal = report::render(&loaded.name, &loaded.source, &diags, false);
+    if fatal == 0 {
+        let warns = diags.len();
+        if warns == 0 {
+            eprintln!("yana verify: {} — no issues", loaded.name);
+        } else {
+            eprintln!("yana verify: {} — {warns} warning(s), no errors", loaded.name);
+        }
+    }
+    fatal as i32
 }
 
 fn cmd_expand(path: &Path, macros: bool) -> i32 {
