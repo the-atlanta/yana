@@ -40,3 +40,13 @@ impl Span {
         self.len() == 0
     }
 }
+
+/// A parsed payload plus its source span.
+///
+/// Lives here (not in the parser) so AST types like [`crate::Contracts`] can
+/// carry spanned sub-expressions without a dependency on `yana-parser`.
+#[derive(Debug, Clone)]
+pub struct Sp<T> {
+    pub v: T,
+    pub span: Span,
+}

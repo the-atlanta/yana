@@ -293,3 +293,107 @@ fn use_may_mix_with_other_items() {
     assert!(matches!(&file.items[0], Item::Use { .. }));
     assert!(matches!(&file.items[1], Item::Fn(_)));
 }
+
+// ---------------------------------------------------------------------------
+// §14.4 minimal contracts: requires/ensures clauses (SPEC §15 ✅ 30.10)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn contracts_parse_on_fn() {
+    let src = r#"
+fn div(n @ rdi: u64, d @ rsi: u64) -> rax: u64
+requires d != 0;
+ensures rax >= 0;
+{
+    return;
+}
+"#;
+    let file = parse_ok(src);
+    match &file.items[0] {
+        Item::Fn(f) => {
+            assert_eq!(f.contracts.requires.len(), 1);
+            assert_eq!(f.contracts.ensures.len(), 1);
+            // `d != 0` is a Binary Ne over Name(d) and Int(0)
+            match &f.contracts.requires[0].v {
+                yana_ast::ConstExpr::Binary { op: yana_ast::ConstBinOp::Ne, lhs, rhs, .. } => {
+                    assert!(matches!(lhs.as_ref(), yana_ast::ConstExpr::Name { name, .. } if name == "d"));
+                    assert!(matches!(rhs.as_ref(), yana_ast::ConstExpr::Int { value: 0, .. }));
+                }
+                other => panic!("expected `d != 0`, got {other:?}"),
+            }
+            // clause spans are real (not dummy)
+            assert!(!f.contracts.requires[0].span.is_dummy());
+        }
+        other => panic!("expected fn, got {other:?}"),
+    }
+}
+
+#[test]
+fn contracts_parse_after_clobbers_before_body() {
+    let src = r#"
+fn f(n @ rdi: u64) -> rax: u64
+clobbers:
+    rcx,
+requires n > 0;
+requires n < 100;
+ensures rax > 0;
+ensures rax <= 100;
+{
+    return;
+}
+"#;
+    let file = parse_ok(src);
+    match &file.items[0] {
+        Item::Fn(f) => {
+            assert!(f.clobbers.is_some());
+            assert_eq!(f.contracts.requires.len(), 2);
+            assert_eq!(f.contracts.ensures.len(), 2);
+        }
+        other => panic!("expected fn, got {other:?}"),
+    }
+}
+
+#[test]
+fn contracts_parse_on_extern_fn() {
+    // spec order: clobbers block first, then contract clauses, then `;`
+    let src = r#"
+#[syscall(1)]
+extern fn write(fd @ rdi: u64, buf @ rsi: *u8, len @ rdx: u64) -> rax: i64
+clobbers:
+    rcx,
+    r11,
+requires len > 0;
+;
+"#;
+    let file = parse_ok(src);
+    match &file.items[0] {
+        Item::ExternFn(e) => {
+            assert_eq!(e.contracts.requires.len(), 1);
+            assert!(e.contracts.ensures.is_empty());
+        }
+        other => panic!("expected extern fn, got {other:?}"),
+    }
+}
+
+#[test]
+fn fn_without_contracts_keeps_empty_default() {
+    let file = parse_ok("fn f() -> rax: u64 { return; }");
+    match &file.items[0] {
+        Item::Fn(f) => assert!(f.contracts.is_empty()),
+        other => panic!("expected fn, got {other:?}"),
+    }
+}
+
+#[test]
+fn contract_expr_uses_const_precedence() {
+    // `n > 0 && n < 10` parses as And(Gt, Lt), not Gt(n, And(...))
+    let src = "fn f(n @ rdi: u64)\nrequires n > 0 && n < 10;\n{ }\n";
+    let file = parse_ok(src);
+    match &file.items[0] {
+        Item::Fn(f) => match &f.contracts.requires[0].v {
+            yana_ast::ConstExpr::Binary { op: yana_ast::ConstBinOp::And, .. } => {}
+            other => panic!("expected && at top, got {other:?}"),
+        },
+        other => panic!("expected fn, got {other:?}"),
+    }
+}

@@ -478,14 +478,29 @@ ClobbersOpt: Option<Clobbers> = {
         Some(Clobbers { regs, span: Span::new(lo as u32, hi as u32) }),
 };
 
+// §14.4 minimal contracts (SPEC §15 ✅ 30.10): `requires <expr>;` /
+// `ensures <expr>;` clauses after the optional clobbers block, before the
+// body. Expressions reuse the ConstExpr precedence chain.
+ContractsOpt: yana_ast::Contracts = {
+    => yana_ast::Contracts::default(),
+    <c: ContractClause+> => gram::contracts_of(c),
+};
+
+ContractClause: (gram::ContractKind, gram::Sp<ConstExpr>) = {
+    <lo: @L> "requires" <e: ConstExpr> ";" <hi: @R> =>
+        gram::contract_clause(gram::ContractKind::Requires, e, lo, hi),
+    <lo: @L> "ensures" <e: ConstExpr> ";" <hi: @R> =>
+        gram::contract_clause(gram::ContractKind::Ensures, e, lo, hi),
+};
+
 FnItem: yana_ast::FnItem = {
-    <lo: @L> <attrs: Attrs> "fn" <i: IdentSp> "(" <params: Comma0<Param>> ")" <ret: RetSig> <cl: ClobbersOpt> <body: Block> <hi: @R> =>
-        gram::fn_item(attrs, i, params, ret, cl, body, lo, hi),
+    <lo: @L> <attrs: Attrs> "fn" <i: IdentSp> "(" <params: Comma0<Param>> ")" <ret: RetSig> <cl: ClobbersOpt> <ct: ContractsOpt> <body: Block> <hi: @R> =>
+        gram::fn_item(attrs, i, params, ret, cl, ct, body, lo, hi),
 };
 
 ExternFn: yana_ast::ExternFnItem = {
-    <lo: @L> <attrs: Attrs> "extern" <abi: AbiStr?> "fn" <i: IdentSp> "(" <params: Comma0<Param>> ")" <ret: RetSig> <cl: ClobbersOpt> ";" <hi: @R> =>
-        gram::extern_fn_item(attrs, abi, i, params, ret, cl, lo, hi),
+    <lo: @L> <attrs: Attrs> "extern" <abi: AbiStr?> "fn" <i: IdentSp> "(" <params: Comma0<Param>> ")" <ret: RetSig> <cl: ClobbersOpt> <ct: ContractsOpt> ";" <hi: @R> =>
+        gram::extern_fn_item(attrs, abi, i, params, ret, cl, ct, lo, hi),
 };
 
 AbiStr: String = {

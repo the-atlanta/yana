@@ -6,7 +6,7 @@
 
 use crate::place::Place;
 use crate::reg::Reg;
-use crate::span::Span;
+use crate::span::{Span, Sp};
 use crate::ty::Ty;
 
 /// A parsed source file.
@@ -136,6 +136,8 @@ pub struct FnItem {
     pub sig: FnSig,
     /// Clobber list (§5.4). `None` = derive by analysis (later pass).
     pub clobbers: Option<Clobbers>,
+    /// §14.4 minimal contracts (`requires`/`ensures`, SPEC §15 ✅ 30.10).
+    pub contracts: Contracts,
     pub body: Block,
     pub span: Span,
 }
@@ -152,6 +154,23 @@ pub struct Clobbers {
     pub span: Span,
 }
 
+/// §14.4 minimal contracts (SPEC §15 ✅ 30.10): `requires <expr>;` /
+/// `ensures <expr>;` clauses after the optional `clobbers:` block, before the
+/// body. Expressions reuse the [`ConstExpr`] shape; identifiers name
+/// parameters (and, in `ensures`, result registers) — validated at resolve
+/// time (`verify-contract-name`).
+#[derive(Debug, Clone, Default)]
+pub struct Contracts {
+    pub requires: Vec<Sp<ConstExpr>>,
+    pub ensures: Vec<Sp<ConstExpr>>,
+}
+
+impl Contracts {
+    pub fn is_empty(&self) -> bool {
+        self.requires.is_empty() && self.ensures.is_empty()
+    }
+}
+
 /// `extern fn` declaration (§5.5), e.g. `#[syscall(1)] extern fn write(...)`.
 #[derive(Debug, Clone)]
 pub struct ExternFnItem {
@@ -160,6 +179,9 @@ pub struct ExternFnItem {
     pub abi: Option<String>,
     pub sig: FnSig,
     pub clobbers: Option<Clobbers>,
+    /// §14.4 minimal contracts — accepted on externs for symmetry; pass 4
+    /// only checks call sites against them (no body to verify ensures on).
+    pub contracts: Contracts,
     pub span: Span,
 }
 
