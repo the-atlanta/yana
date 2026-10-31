@@ -108,6 +108,15 @@ impl Diagnostic {
         self
     }
 
+    /// Set the message drawn under the primary underline (ariadne renders an
+    /// empty `╰──` when the primary label has no text).
+    pub fn with_primary_label(mut self, message: impl Into<String>) -> Self {
+        if let Some(l) = self.labels.iter_mut().find(|l| l.primary) {
+            l.message = message.into();
+        }
+        self
+    }
+
     /// The primary span, if any.
     pub fn primary_span(&self) -> Option<Span> {
         self.labels.iter().find(|l| l.primary).map(|l| l.span).or_else(|| self.labels.first().map(|l| l.span))

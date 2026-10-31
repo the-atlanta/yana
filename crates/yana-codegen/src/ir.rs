@@ -114,6 +114,10 @@ pub struct FnBody {
     /// end is expected (it should end in a noreturn call/syscall), so the
     /// fallthrough check is suppressed and a reachable plain `ret` is flagged.
     pub returns_never: bool,
+    /// Names of register bindings by normalized 64-bit register (last bind
+    /// wins). Liveness uses this to keep dead-store quiet for `_`-prefixed
+    /// bindings — an intentional sink, Rust's `_` convention (SPEC §11 ✅).
+    pub reg_names: std::collections::HashMap<Reg, String>,
 }
 
 /// The §14.4 contract clauses of one function symbol, resolved to IR-level

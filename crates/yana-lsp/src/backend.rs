@@ -43,13 +43,13 @@ impl Backend {
 
         let parsed = yana_parser::parse(source);
         for d in &parsed.diagnostics {
-            diags.push(convert(d, &map, false));
+            diags.push(convert(d, &map, false, &uri));
         }
 
         if let Some(file) = &parsed.file {
             let out = resolve_module(file, &TargetInfo::linux_x86_64(), &ResolveOptions::default());
             for d in &out.diagnostics {
-                diags.push(convert(d, &map, false));
+                diags.push(convert(d, &map, false, &uri));
             }
         }
 
@@ -57,7 +57,7 @@ impl Backend {
     }
 }
 
-fn convert(d: &yana_ast::Diagnostic, map: &SourceMap, strict: bool) -> Diagnostic {
+fn convert(d: &yana_ast::Diagnostic, map: &SourceMap, strict: bool, uri: &Url) -> Diagnostic {
     let level = d.adjusted_level(strict);
     let severity = match level {
         yana_ast::DiagLevel::Error => DiagnosticSeverity::ERROR,
@@ -65,7 +65,30 @@ fn convert(d: &yana_ast::Diagnostic, map: &SourceMap, strict: bool) -> Diagnosti
         yana_ast::DiagLevel::Note => DiagnosticSeverity::INFORMATION,
     };
     let span = d.primary_span().unwrap_or(yana_ast::Span::DUMMY);
-    make_diag(severity, d.kind.clone(), d.message.clone(), d.help.clone(), map, span)
+    let mut diag = make_diag(severity, d.kind.clone(), d.message.clone(), d.help.clone(), map, span);
+    // secondary labels → relatedInformation (e.g. "first bound here")
+    let related: Vec<DiagnosticRelatedInformation> = d
+        .labels
+        .iter()
+        .filter(|l| !l.primary)
+        .map(|l| {
+            let ((sl, sc), (el, ec)) = map.span_to_range(l.span);
+            DiagnosticRelatedInformation {
+                location: Location {
+                    uri: uri.clone(),
+                    range: Range {
+                        start: Position { line: sl, character: sc },
+                        end: Position { line: el, character: ec },
+                    },
+                },
+                message: l.message.clone(),
+            }
+        })
+        .collect();
+    if !related.is_empty() {
+        diag.related_information = Some(related);
+    }
+    diag
 }
 
 fn make_diag(

@@ -127,6 +127,11 @@ pub fn check(module: &Module, body: &FnBody, cfg: &Cfg) -> Vec<Diagnostic> {
                     if w64.name() == "rsp" {
                         continue;
                     }
+                    // `_`-prefixed bindings are intentional sinks (SPEC §11 ✅):
+                    // the author already said the value is never read.
+                    if body.reg_names.get(&w64).map_or(false, |n| n.starts_with('_')) {
+                        continue;
+                    }
                     diags.push(
                         Diagnostic::warn(
                             DiagCode::Redundant,
@@ -137,7 +142,11 @@ pub fn check(module: &Module, body: &FnBody, cfg: &Cfg) -> Vec<Diagnostic> {
                             ),
                             si.span,
                         )
-                        .with_help("remove the write, or mark the binding volatile if the store is observable (§12)"),
+                        .with_help(
+                            "remove the write; mark the binding volatile if the store is \
+                             observable (§12); or give the binding a `_` prefix (`_sink`) if \
+                             the value is intentionally never read",
+                        ),
                     );
                 }
             }

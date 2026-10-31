@@ -744,6 +744,100 @@ fn f() {
 }
 
 // ---------------------------------------------------------------------------
+// §11 diagnostics UX (review 31.10): `_` discard, label texts, second spans
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wildcard_bind_is_repeatable_and_holds_no_name() {
+    // `_` is the discard: two `bind _` in one scope are fine, and `_` never
+    // conflicts with a named binding on the same register.
+    let src = r#"
+fn f() {
+    bind a @ rax: u64 = 1;
+    bind _ @ rax: u64 = 0x0000000A21646C72;
+    bind _ @ rax: u64 = 0x6F77206F6C6C6548;
+    return;
+}
+"#;
+    let (_, diags) = resolve(src);
+    assert!(
+        !diags.iter().any(|d| matches!(d.level, yana_ast::DiagLevel::Error)),
+        "`_` must be freely rebindable: {:?}",
+        diags.iter().map(|d| (&d.kind, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn dup_bind_labels_point_at_both_sites() {
+    let src = r#"
+fn f() {
+    bind a @ rax: u64 = 1;
+    bind a @ rcx: u64 = 2;
+    return;
+}
+"#;
+    let (_, diags) = resolve(src);
+    let d = diags.iter().find(|d| d.kind == "dup-bind").expect("dup-bind expected");
+    // primary label has text (no empty `╰──`) and a secondary points at the first bind
+    let primary = d.labels.iter().find(|l| l.primary).unwrap();
+    assert!(!primary.message.is_empty(), "primary label must carry text");
+    let secondary = d.labels.iter().find(|l| !l.primary).expect("secondary label expected");
+    assert!(
+        secondary.message.contains("first bound here") && secondary.message.contains("`a`"),
+        "secondary label: {:?}",
+        secondary.message
+    );
+    // secondary span is the FIRST bind statement (earlier in the source)
+    assert!(secondary.span.lo < primary.span.lo, "secondary must point backwards");
+    let help = d.help.as_deref().unwrap();
+    assert!(help.contains("{ ... }") && help.contains("`_`"), "help must offer block/`_`: {help}");
+}
+
+#[test]
+fn reg_conflict_underlines_name_and_offers_fixes() {
+    let src = "fn f() {\n    bind a @ rax: u64 = 1;\n    bind aa @ rax: u64 = 2;\n    return;\n}\n";
+    let (_, diags) = resolve(src);
+    let d = diags.iter().find(|d| d.kind == "reg-conflict").expect("reg-conflict expected");
+    // primary span = the NAME `aa`, not the whole statement
+    let p = d.primary_span().unwrap();
+    assert_eq!(p.hi - p.lo, 2, "must underline just `aa`, got span {:?}", p);
+    assert_eq!(&src[p.lo as usize..p.hi as usize], "aa");
+    // secondary label shows who holds the register
+    let secondary = d.labels.iter().find(|l| !l.primary).expect("secondary label expected");
+    assert!(
+        secondary.message.contains("`a` is bound to rax here"),
+        "secondary label: {:?}",
+        secondary.message
+    );
+    let primary = d.labels.iter().find(|l| l.primary).unwrap();
+    assert!(!primary.message.is_empty(), "primary label must carry text");
+    let help = d.help.as_deref().unwrap();
+    assert!(help.contains("{ ... }") && help.contains("`_`"), "help must offer block/`_`: {help}");
+}
+
+#[test]
+fn underscore_prefix_suppresses_dead_store() {
+    // `_sink` is an intentional sink: no dead-store note…
+    let src = "fn f() {\n    bind _sink @ rcx: u64 = 42;\n    return;\n}\n";
+    let (mut module, diags) = resolve(src);
+    assert!(!diags.iter().any(|d| matches!(d.level, yana_ast::DiagLevel::Error)), "{:?}", diags);
+    let analysis = yana_analysis::analyze(&mut module);
+    assert!(
+        !analysis.iter().any(|d| d.kind == "dead-store"),
+        "`_`-prefixed binding must not warn: {:?}",
+        analysis.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    // …while the same code without the prefix does warn, and the help
+    // mentions the `_` convention.
+    let src2 = "fn f() {\n    bind sink @ rcx: u64 = 42;\n    return;\n}\n";
+    let (mut module2, _) = resolve(src2);
+    let analysis2 = yana_analysis::analyze(&mut module2);
+    let dead = analysis2.iter().find(|d| d.kind == "dead-store").expect("dead-store expected");
+    let help = dead.help.as_deref().unwrap();
+    assert!(help.contains("volatile") && help.contains("`_`"), "help must offer both options: {help}");
+}
+
+// ---------------------------------------------------------------------------
 // §14.4 contracts: resolve plumbing (names validated at resolve time)
 // ---------------------------------------------------------------------------
 

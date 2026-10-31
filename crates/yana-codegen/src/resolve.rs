@@ -749,6 +749,7 @@ impl Resolver {
             branches: Vec::new(),
             result_regs,
             returns_never,
+            reg_names: std::collections::HashMap::new(),
         };
         self.labels.clear();
         self.pending_jumps.clear();
@@ -875,27 +876,79 @@ impl Resolver {
                     self.err("bind-place", "function-local bind cannot target a section", *span);
                     return;
                 }
+                // `_` is the discard (Rust convention, SPEC §11 ✅): rebindable,
+                // holds no name and no register; its writes are intentional sinks.
+                let is_wildcard = name == "_";
                 // duplicate name in same scope?
-                if self.scopes.last().map(|s| s.contains_key(&name)).unwrap_or(false) {
-                    self.err("dup-bind", format!("`{name}` is already bound in this scope"), *name_span);
+                if !is_wildcard
+                    && self.scopes.last().map(|s| s.contains_key(&name)).unwrap_or(false)
+                {
+                    let first_span = self
+                        .scopes
+                        .last()
+                        .and_then(|s| s.get(&name))
+                        .map(|b| b.span)
+                        .unwrap_or(*name_span);
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            DiagCode::Semantic,
+                            "dup-bind",
+                            format!("`{name}` is already bound in this scope"),
+                            *name_span,
+                        )
+                        .with_primary_label("re-bound here")
+                        .with_label(format!("`{name}` is first bound here"), first_span, false)
+                        .with_help(
+                            "bindings live to the end of the block: wrap the earlier one in a \
+                             nested `{ ... }` block, rename it, or use `_` if the value is a discard",
+                        ),
+                    );
                 }
                 // §3 🟡 two names on one register at once is an error
-                if let Operand::Reg(r) = &operand {
-                    let conflict = self.scopes.iter().rev().find_map(|scope| {
-                        scope.iter().find_map(|(other, b)| {
-                            (other != &name && b.operand == Operand::Reg(*r)).then(|| other.clone())
-                        })
-                    });
-                    if let Some(other) = conflict {
-                        self.err(
-                            "reg-conflict",
-                            format!("`{name}` and `{other}` are bound to {} at the same time (§3)", r.name()),
-                            *span,
-                        );
+                if !is_wildcard {
+                    if let Operand::Reg(r) = &operand {
+                        let conflict = self.scopes.iter().rev().find_map(|scope| {
+                            scope.iter().find_map(|(other, b)| {
+                                (other != &name && b.operand == Operand::Reg(*r))
+                                    .then(|| (other.clone(), b.span))
+                            })
+                        });
+                        if let Some((other, other_span)) = conflict {
+                            self.diagnostics.push(
+                                Diagnostic::error(
+                                    DiagCode::Semantic,
+                                    "reg-conflict",
+                                    format!(
+                                        "`{name}` and `{other}` are bound to {} at the same time (§3)",
+                                        r.name()
+                                    ),
+                                    *name_span,
+                                )
+                                .with_primary_label(format!("`{name}` wants {} here", r.name()))
+                                .with_label(
+                                    format!("`{other}` is bound to {} here", r.name()),
+                                    other_span,
+                                    false,
+                                )
+                                .with_help(
+                                    "a binding holds its register until the end of the block even \
+                                     after its last use: close the earlier binding in a nested \
+                                     `{ ... }` block, or bind the value to `_`",
+                                ),
+                            );
+                        }
                     }
                 }
                 let ty_for_init = ty.clone();
-                self.define(name, Binding { operand: operand.clone(), ty, mutable: *mutable, span: *span });
+                if let Operand::Reg(r) = &operand {
+                    // liveness: remember which name holds this register, so
+                    // `_`-prefixed sinks never produce dead-store warnings.
+                    let r64 = r.resize(yana_ast::reg::RegSize::R64).unwrap_or(*r);
+                    self.body.reg_names.insert(r64, name.clone());
+                }
+                if !is_wildcard {
+                    self.define(name, Binding { operand: operand.clone(), ty, mutable: *mutable, span: *span });
+                }
                 if let Some(v) = init {
                     // initial write: no `alt` needed (§4.2)
                     self.lower_write(&operand, &ty_for_init, v, *span);
