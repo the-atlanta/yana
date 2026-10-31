@@ -18,8 +18,9 @@ use yana_ast::{
 use crate::consteval::{self, ConstEnv, Value as CValue};
 use crate::insn;
 use crate::ir::{
-    AtomicOp, BranchUse, CallContract, DataItem, Displacement, FnBody, Insn, Jcc, LabelDef, MemOp,
-    MemOrder, Module, Operand, SectionData, SpannedInsn, Symbol, SymbolKind, WideOp,
+    AtomicOp, BranchUse, CallContract, DataItem, Displacement, FnBody, FnContracts, Insn, Jcc,
+    LabelDef, MemOp, MemOrder, Module, Operand, SectionData, SpannedInsn, Symbol, SymbolKind,
+    WideOp,
 };
 use crate::target::{Arch, ImportedDecl, ResolveOptions, TargetInfo};
 
@@ -194,6 +195,7 @@ impl Resolver {
                         exported: false,
                         syscall: None,
                         clobbers: vec![],
+                        contracts: FnContracts::default(),
                         span: Span::DUMMY,
                     });
                     self.consts.insert(name.clone(), value);
@@ -209,6 +211,7 @@ impl Resolver {
                         exported: true,
                         syscall: None,
                         clobbers: vec![],
+                        contracts: FnContracts::default(),
                         span: Span::DUMMY,
                     });
                     self.statics.insert(
@@ -273,25 +276,27 @@ impl Resolver {
         // functions and externs → symbols
         for item in &file.items {
             match item {
-                Item::Fn(f) => self.collect_fn(
+                Item::Fn(f) => self.collect_fn_with_contracts(
                     &f.sig,
                     f.exported,
                     f.is_entry(),
                     None,
                     false,
                     f.clobbers.as_ref().map(|c| c.regs.clone()).unwrap_or_default(),
+                    f.contracts.clone(),
                     f.span,
                 ),
                 Item::ExternFn(e) => {
                     let syscall = e.syscall_number();
                     let real_call = e.abi.as_deref() == Some("C");
-                    self.collect_fn(
+                    self.collect_fn_with_contracts(
                         &e.sig,
                         true,
                         false,
                         syscall,
                         true,
                         e.clobbers.as_ref().map(|c| c.regs.clone()).unwrap_or_default(),
+                        e.contracts.clone(),
                         e.span,
                     );
                     if let Some(sym) = self.module.find(&e.sig.name) {
@@ -364,6 +369,7 @@ impl Resolver {
             exported: s.attrs.iter().any(|a| a.has_name("global")),
             syscall: None,
             clobbers: vec![],
+            contracts: FnContracts::default(),
             span: s.span,
         });
         let sec = self.module.section_mut(section);
@@ -438,6 +444,7 @@ impl Resolver {
             exported: false,
             syscall: None,
             clobbers: vec![],
+            contracts: FnContracts::default(),
             span: c.span,
         });
         self.consts.insert(c.name.clone(), 0); // patched by eval_const
@@ -492,6 +499,20 @@ impl Resolver {
         clobbers: Vec<Reg>,
         span: Span,
     ) {
+        self.collect_fn_with_contracts(sig, exported, is_entry, syscall, is_extern, clobbers, yana_ast::Contracts::default(), span)
+    }
+
+    fn collect_fn_with_contracts(
+        &mut self,
+        sig: &FnSig,
+        exported: bool,
+        is_entry: bool,
+        syscall: Option<i64>,
+        is_extern: bool,
+        clobbers: Vec<Reg>,
+        ast_contracts: yana_ast::Contracts,
+        span: Span,
+    ) {
         if self.fns.contains_key(&sig.name) || self.statics.contains_key(&sig.name) {
             self.err("dup-symbol", format!("symbol `{}` declared twice", sig.name), span);
             return;
@@ -539,6 +560,10 @@ impl Resolver {
             },
         };
 
+        // §14.4 contracts: build the IR-level form and validate every ident
+        // against the signature (`verify-contract-name`).
+        let contracts = self.lower_contracts(sig, &ret, &ast_contracts);
+
         let sym_idx = self.module.symbols.len();
         // externs have no body: ExternFn; real fns get a body index in pass 2.
         // (We mark externs when the caller said so via `real_call`/syscall or
@@ -555,6 +580,7 @@ impl Resolver {
             exported: exported || is_entry || syscall.is_some(),
             syscall,
             clobbers: if syscall.is_some() { vec![Reg::parse("rcx").unwrap(), Reg::parse("r11").unwrap()] } else { clobbers },
+            contracts,
             span,
         });
 
@@ -569,6 +595,117 @@ impl Resolver {
 
     fn param_operand(&self, p: &Param) -> Operand {
         self.place_to_operand_simple(&p.place)
+    }
+
+    /// §14.4: build the IR contract form and validate clause idents against
+    /// the signature. In `requires`/`ensures` an ident names a parameter; in
+    /// `ensures` idents may ALSO name result registers (ret-sig binding name,
+    /// or the bare register name for `-> rax: u64`). Unknown ident →
+    /// `verify-contract-name`; unsupported expression shapes → 
+    /// `verify-contract-expr` (docs/NOTES-verify.md D6).
+    fn lower_contracts(
+        &mut self,
+        sig: &FnSig,
+        ret: &RetInfo,
+        c: &yana_ast::Contracts,
+    ) -> FnContracts {
+        use yana_ast::reg::RegSize;
+        let norm = |r: Reg| r.resize(RegSize::R64).unwrap_or(r);
+        let params: Vec<(String, Reg)> = sig
+            .params
+            .iter()
+            .filter_map(|p| match self.param_operand(p) {
+                Operand::Reg(r) => Some((p.name.clone(), norm(r))),
+                _ => None,
+            })
+            .collect();
+        let results: Vec<(String, Reg)> = match ret {
+            RetInfo::Single { operand: Operand::Reg(r), .. } => vec![(norm(*r).name().to_string(), norm(*r))],
+            RetInfo::Tuple { parts } => parts
+                .iter()
+                .filter_map(|p| match &p.operand {
+                    Operand::Reg(r) => Some((p.name.clone(), norm(*r))),
+                    _ => None,
+                })
+                .collect(),
+            _ => vec![],
+        };
+        let mut out = FnContracts {
+            requires: Vec::new(),
+            ensures: Vec::new(),
+            params: params.clone(),
+            results: results.clone(),
+        };
+        for sp in &c.requires {
+            if self.check_contract_expr(&sp.v, &params, &[]) {
+                out.requires.push((sp.v.clone(), sp.span));
+            }
+        }
+        for sp in &c.ensures {
+            // ensures may also name result regs; allow reg names as idents too
+            let mut allowed: Vec<(String, Reg)> = params.clone();
+            allowed.extend(results.iter().cloned());
+            if self.check_contract_expr(&sp.v, &allowed, &results) {
+                out.ensures.push((sp.v.clone(), sp.span));
+            }
+        }
+        out
+    }
+
+    /// Validate one contract expression. `allowed` are the ident names in
+    /// scope; `results` additionally allows bare result-register names
+    /// (`rax`) in ensures clauses. Returns false when a diagnostic was
+    /// emitted (the clause is dropped).
+    fn check_contract_expr(
+        &mut self,
+        e: &yana_ast::ConstExpr,
+        allowed: &[(String, Reg)],
+        results: &[(String, Reg)],
+    ) -> bool {
+        let mut ok = true;
+        match e {
+            yana_ast::ConstExpr::Name { name, span } => {
+                let known = allowed.iter().any(|(n, _)| n == name)
+                    || results.iter().any(|(_, r)| r.name() == name);
+                if !known {
+                    let mut valid: Vec<&str> = allowed.iter().map(|(n, _)| n.as_str()).collect();
+                    for (_, r) in results {
+                        if !valid.contains(&r.name()) {
+                            valid.push(r.name());
+                        }
+                    }
+                    self.err_help(
+                        "verify-contract-name",
+                        format!("`{name}` is not a parameter or result of this function (§14.4)"),
+                        if valid.is_empty() {
+                            "this function has no names available in contract clauses".to_string()
+                        } else {
+                            format!("valid names: {}", valid.join(", "))
+                        },
+                        *span,
+                    );
+                    ok = false;
+                }
+            }
+            yana_ast::ConstExpr::Int { .. } | yana_ast::ConstExpr::Bool { .. } => {}
+            yana_ast::ConstExpr::Unary { expr, .. } => {
+                ok &= self.check_contract_expr(expr, allowed, results);
+            }
+            yana_ast::ConstExpr::Binary { lhs, rhs, .. } => {
+                ok &= self.check_contract_expr(lhs, allowed, results);
+                ok &= self.check_contract_expr(rhs, allowed, results);
+            }
+            other => {
+                self.err_help(
+                    "verify-contract-expr",
+                    format!("unsupported expression shape in a contract clause ({})", contract_shape_name(other)),
+                    "contracts are minimal (§15 30.10): integers, comparisons, &&/||, arithmetic, unary -/!",
+                    expr_span(other),
+                );
+                ok = false;
+            }
+        }
+        ok
     }
 
     /// Simplified place → operand for signatures (registers only, really).
@@ -2002,6 +2139,18 @@ fn init_kind_name(v: &Value) -> &'static str {
         Value::Mul { .. } => "wide multiply",
         Value::Field { .. } => "field access",
         Value::Const { .. } => "const block",
+    }
+}
+
+/// Human name for an unsupported contract expression shape (§14.4).
+fn contract_shape_name(e: &yana_ast::ConstExpr) -> &'static str {
+    match e {
+        yana_ast::ConstExpr::If { .. } => "if-expression",
+        yana_ast::ConstExpr::Call { .. } => "function call",
+        yana_ast::ConstExpr::Array { .. } => "array literal",
+        yana_ast::ConstExpr::Tuple { .. } => "tuple literal",
+        yana_ast::ConstExpr::Repeat { .. } => "repeat literal",
+        _ => "expression",
     }
 }
 
