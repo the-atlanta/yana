@@ -1,0 +1,45 @@
+// verify.yana — §14 pass 4 demo: interval analysis + contracts.
+//
+//   yana verify examples/verify.yana         → 0 errors: the branch guard
+//                                              refines the divisor away from 0
+//                                              and z3 proves both contracts
+//   yana build --verify examples/verify.yana → builds; the exe exits 100.
+//
+// What pass 4 proves here:
+//  1. verify-div-zero: `branch (d == 0) => 'bad;` gives the fall-through
+//     edge d ∈ [1, …] — the division's divisor cannot be 0 there.
+//  2. verify-requires: at the call site the interval fact for d is the
+//     point 5, so `requires d != 0` is proven via z3 (QF_NIA).
+//  3. verify-ensures: quot's body sets rax = 100, so `ensures rax <= 100`
+//     holds at the return.
+
+#[syscall(60)]
+extern fn exit(code @ rdi: u64) -> !;
+
+fn quot(n @ rdi: u64, d @ rsi: u64) -> rax: u64
+requires d != 0;
+ensures rax <= 100;
+{
+    alt rax = 100;
+    return;
+}
+
+#[entry]
+fn main() -> ! {
+    bind mut d @ rsi: u64 = 5;
+    alt rax = 100;
+    alt rdx = 0;
+
+    branch (d == 0) => 'bad;
+    // rdx:rax = 0:100 / d — safe: this edge knows d ≠ 0
+    alt (rax, rdx) = rdx:rax /% d;
+    branch => 'done;
+
+    label (bad) { call exit { code: 255 }; }
+
+    label (done) {
+        bind q = call quot { n: rax, d: d };
+        alt rdi = q;
+        call exit { code: rdi @ rdi };
+    }
+}

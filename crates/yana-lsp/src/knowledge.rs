@@ -30,6 +30,8 @@ pub fn keywords() -> Vec<Item> {
         Item { label: "extern", detail: "внешняя функция (§5.5)", docs: "#[syscall(N)] extern fn write(fd @ rdi: u64, ...) -> rax: i64;", insert: Some("#[syscall(${1:1})]\nextern fn ${2:name}(${3:args}) -> ${4:rax: i64};") },
         Item { label: "const", detail: "константа / const fn (§7, §8)", docs: "const NAME: T = выражение; const fn — вычисление при сборке, без памяти и регистров.", insert: Some("const ${1:NAME}: ${2:u64} = ${3:0};") },
         Item { label: "clobbers", detail: "порча регистров (§5.4)", docs: "clobbers: rcx, r11, — блок есть: портится ровно перечисленное.", insert: Some("clobbers:\n    ${1:rcx},\n    ${2:r11},") },
+        Item { label: "requires", detail: "контракт входа (§14.4)", docs: "requires <expr>; — предусловие после clobbers, до тела. Имена — параметры функции. Проверяется на месте вызова (z3, QF_NIA); доказуемое нарушение → verify-requires (ошибка).", insert: Some("requires ${1:n > 0};") },
+        Item { label: "ensures", detail: "контракт выхода (§14.4)", docs: "ensures <expr>; — постусловие после requires. Имена — параметры и регистры результата (rax или имя привязки -> (lo @ rax)). Проверяется на каждом выходе (return / конец тела); нарушение → verify-ensures (ошибка).", insert: Some("ensures ${1:rax >= 0};") },
         Item { label: "mut", detail: "изменяемая привязка (§3)", docs: "По умолчанию привязка неизменяема; запись требует mut + alt.", insert: None },
         Item { label: "as", detail: "приведение (§4.2)", docs: "Расширение по знаковости источника; усечение берёт младшую часть (d as u8 = dl).", insert: None },
         Item { label: "atomic", detail: "атомарный RMW (§12)", docs: "alt atomic(order) @[p]: u64 += 1; — одна locked-инструкция. Порядки: relaxed, acquire, release, acqrel, seqcst. Только x86-64.", insert: Some("alt atomic(${1|relaxed,acquire,release,acqrel,seqcst|}) ${2:@[p]}: u64 += ${3:1};") },
@@ -49,8 +51,9 @@ pub fn keywords() -> Vec<Item> {
 }
 
 /// Reserved words (§1) — completing them warns they're future syntax.
+/// `requires`/`ensures` left this list: §14.4 implements them (keywords above).
 pub fn reserved() -> &'static [&'static str] {
-    &["for", "volatile", "atomic", "preserves", "requires", "ensures", "invariant", "use", "mod", "macro", "macro_rules", "align", "let"]
+    &["for", "volatile", "atomic", "preserves", "invariant", "use", "mod", "macro", "macro_rules", "align", "let"]
 }
 
 /// §12 memory orders for `alt atomic(order)` completion.
