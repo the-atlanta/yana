@@ -26,7 +26,7 @@ use yana_ast::reg::{GprBase, Reg, RegSize};
 use yana_ast::{ConstBinOp, ConstExpr, ConstUnOp, DiagCode, DiagLevel, Diagnostic, Span};
 use yana_codegen::insn::insn_info;
 use yana_codegen::{
-    FnBody, Insn, Jcc, Module, Operand, SpannedInsn, WideOp,
+    FnBody, Insn, Jcc, Module, Operand,
 };
 
 use crate::cfg::{self, Cfg};
@@ -320,6 +320,7 @@ fn set_dst(dst: &Operand, v: Ival, st: &mut State) {
         Operand::Mem(_) | Operand::Sym { .. } => {
             st.mem_alive = false; // memory write kills all memory facts (D2)
         }
+        Operand::Imm(_) => {} // not a valid destination; nothing to track
     }
 }
 
@@ -708,27 +709,27 @@ fn walk_block(
     block: &cfg::BasicBlock,
     entry: State,
     ctx: &Ctx,
-    out: Option<&mut Visitor>,
-    diags: Option<&mut Vec<Diagnostic>>,
+    mut out: Option<&mut Visitor>,
+    mut diags: Option<&mut Vec<Diagnostic>>,
 ) -> (State, Vec<(usize, State)>) {
     let mut st = entry;
     let (s, e) = block.insns;
     let n = body.insns.len();
     let mut succ: Vec<(usize, State)> = Vec::new();
-    let mut prev: Option<&SpannedInsn> = None;
     for i in s..e.min(n) {
         let si = &body.insns[i];
-        if let Some(d) = diags {
+        // visit BEFORE the transfer: contract checks need the pre-instruction
+        // state (a Call kills caller-saved regs, erasing the actual-arg facts)
+        if let Some(v) = out.as_mut() {
+            v.visit(&si.insn, si.span, &st);
+        }
+        if let Some(d) = &mut diags {
             let mut local = Vec::new();
             xfer(&si.insn, &mut st, ctx, &mut local, si.span);
             d.extend(local);
         } else {
             xfer(&si.insn, &mut st, ctx, &mut Vec::new(), si.span);
         }
-        if let Some(v) = out {
-            v.visit(&si.insn, si.span, &st);
-        }
-        prev = Some(si);
     }
     // successor states
     let last = e.min(n).saturating_sub(1);
@@ -755,7 +756,7 @@ fn walk_block(
                 succ.push((*taken, taken_st));
             } else {
                 succ.push((*fall, st.clone()));
-                succ.push((*taken, st));
+                succ.push((*taken, st.clone()));
             }
         }
         (succs, _) => {
@@ -904,13 +905,28 @@ impl Z3 {
 }
 
 /// Pull `((v_name 12))`-style values out of z3's get-value output.
+/// Handles nested parens (negative literals come back as `(- 5)`).
 fn extract_value(text: &str, var: &str) -> Option<String> {
     let needle = format!("({var} ");
     let at = text.find(&needle)?;
     let rest = &text[at + needle.len()..];
-    let end = rest.find(')')?;
+    let mut depth = 0usize;
+    let mut end = rest.len();
+    for (i, c) in rest.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
     let raw = rest[..end].trim();
-    // forms: "5", "(- 5)", "(~ 5)"... keep it literal
+    // forms: "5", "(- 5)" — keep it literal
     Some(raw.to_string())
 }
 
@@ -924,7 +940,7 @@ struct Visitor<'a> {
     z3: Option<&'a Z3>,
     smt_warned: bool,
     diags: Vec<Diagnostic>,
-    /// entry-parameter facts are unknown → unconstrained vars
+    // entry-parameter facts are unknown → unconstrained vars
 }
 
 impl<'a> Visitor<'a> {
@@ -1179,4 +1195,288 @@ pub fn verify(module: &Module) -> Vec<Diagnostic> {
 /// Convenience for tests/CLI: verify diagnostics that are errors.
 pub fn verify_errors(diags: &[Diagnostic]) -> usize {
     diags.iter().filter(|d| d.level == DiagLevel::Error).count()
+}
+
+// ---------------------------------------------------------------------------
+// Tests (milestone 4: interval arithmetic + fixed point)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yana_codegen::{resolve_module, ResolveOptions, TargetInfo};
+
+    fn module_of(src: &str) -> Module {
+        let parsed = yana_parser::parse(src);
+        assert!(
+            !parsed.has_errors(),
+            "{:?}",
+            parsed.diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        resolve_module(
+            parsed.file.as_ref().unwrap(),
+            &TargetInfo::linux_x86_64(),
+            &ResolveOptions::default(),
+        )
+        .module
+    }
+
+    fn verify_of(src: &str) -> Vec<Diagnostic> {
+        verify(&module_of(src))
+    }
+
+    fn kinds(diags: &[Diagnostic]) -> Vec<&str> {
+        diags.iter().map(|d| d.kind.as_str()).collect()
+    }
+
+    // ---- interval arithmetic corners ----
+
+    #[test]
+    fn iv_arith_corners() {
+        // add: corner sums
+        assert_eq!(
+            iv_add(Ival { lo: -5, hi: 10 }, Ival { lo: 3, hi: 7 }),
+            Ival { lo: -2, hi: 17 }
+        );
+        // add saturates at the i128 bounds instead of overflowing
+        assert_eq!(
+            iv_add(Ival { lo: i128::MAX - 1, hi: i128::MAX }, Ival::point(5)),
+            Ival { lo: i128::MAX, hi: i128::MAX }
+        );
+        // sub: lo−b.hi, hi−b.lo
+        assert_eq!(
+            iv_sub(Ival { lo: 0, hi: 10 }, Ival { lo: 3, hi: 7 }),
+            Ival { lo: -7, hi: 7 }
+        );
+        assert_eq!(
+            iv_sub(Ival { lo: i128::MIN, hi: i128::MIN }, Ival::point(5)),
+            Ival { lo: i128::MIN, hi: i128::MIN }
+        );
+        // mul: hull of the four corners (mixed signs)
+        assert_eq!(
+            iv_mul(Ival { lo: -3, hi: 4 }, Ival { lo: -2, hi: 5 }),
+            Ival { lo: -15, hi: 20 }
+        );
+        // mul overflow → TOP (sound)
+        assert_eq!(
+            iv_mul(Ival { lo: i128::MAX / 2, hi: i128::MAX }, Ival::point(4)),
+            TOP
+        );
+        // BOTTOM propagates
+        assert!(iv_add(BOTTOM, Ival::point(1)).is_bottom());
+        assert!(iv_mul(BOTTOM, BOTTOM).is_bottom());
+        // neg swaps + saturates
+        assert_eq!(iv_neg(Ival { lo: -2, hi: 3 }), Ival { lo: -3, hi: 2 });
+        assert_eq!(iv_neg(Ival::point(i128::MIN)).hi, i128::MAX);
+    }
+
+    #[test]
+    fn hull_intersect_exclude() {
+        assert_eq!(Ival::point(5).hull(Ival::point(-2)), Ival { lo: -2, hi: 5 });
+        // BOTTOM is the identity of hull
+        assert_eq!(BOTTOM.hull(Ival::point(3)), Ival::point(3));
+        // empty intersection → BOTTOM
+        assert!(Ival { lo: 0, hi: 5 }.intersect(Ival { lo: 6, hi: 9 }).is_bottom());
+        // endpoint exclusion is exact; interior stays whole (sound)
+        assert_eq!(Ival { lo: 0, hi: 5 }.exclude_point(0), Ival { lo: 1, hi: 5 });
+        assert_eq!(Ival { lo: 0, hi: 5 }.exclude_point(5), Ival { lo: 0, hi: 4 });
+        assert_eq!(Ival { lo: 0, hi: 5 }.exclude_point(3), Ival { lo: 0, hi: 5 });
+        assert!(Ival::point(3).exclude_point(3).is_bottom());
+    }
+
+    // ---- fixed point over a real CFG ----
+
+    #[test]
+    fn div_zero_detected_after_arith() {
+        // rax = 10; rbx = 0; rdx:rax = rax as u128; /% rbx → divisor is the
+        // POINT 0 → verify-div-zero
+        let diags = verify_of(
+            r#"
+#[entry]
+fn main() -> ! {
+    bind mut a @ rax: u64 = 10;
+    bind mut d @ rbx: u64 = 0;
+    alt a += 5;
+    alt rdx:rax = a as u128;
+    alt (rax, rdx) = rdx:rax /% d;
+    syscall;
+}
+"#,
+        );
+        assert!(
+            kinds(&diags).contains(&"verify-div-zero"),
+            "{:?}",
+            diags.iter().map(|d| (&d.kind, &d.message)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn div_zero_not_flagged_when_guarded() {
+        // the branch guard proves the divisor nonzero on the dividing path
+        let diags = verify_of(
+            r#"
+#[entry]
+fn main() -> ! {
+    bind mut a @ rax: u64 = 100;
+    bind mut d @ rbx: u64;
+    alt rbx = 7;
+    branch (d == 0) => 'skip;
+    alt rdx:rax = a as u128;
+    alt (rax, rdx) = rdx:rax /% d;
+    branch => 'end;
+    label (skip) { alt rax = 0; }
+    label (end) { syscall; }
+}
+"#,
+        );
+        assert!(
+            !kinds(&diags).contains(&"verify-div-zero"),
+            "guarded division must not be flagged: {:?}",
+            diags.iter().map(|d| (&d.kind, &d.message)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn div_zero_flagged_when_guard_only_partial() {
+        // guard excludes 0 only on one path; the join widens back to [0,9]
+        // at the merge → the div AFTER the merge is unproven
+        let diags = verify_of(
+            r#"
+#[entry]
+fn main() -> ! {
+    bind mut a @ rax: u64 = 100;
+    bind mut d @ rbx: u64 = 4;
+    branch (d == 0) => 'other;
+    label (other) { alt d = 9; }
+    alt rdx:rax = a as u128;
+    alt (rax, rdx) = rdx:rax /% d;
+    syscall;
+}
+"#,
+        );
+        // both branches give d ∈ {4, 9}, neither contains 0 → NOT flagged
+        assert!(
+            !kinds(&diags).contains(&"verify-div-zero"),
+            "{:?}",
+            diags.iter().map(|d| (&d.kind, &d.message)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn fixed_point_terminates_on_loops() {
+        // countdown loop: the back edge must widen to a fixpoint quickly
+        let m = module_of(
+            r#"
+#[entry]
+fn main() -> ! {
+    bind mut n @ rbx: u64 = 10;
+    label (loop) {
+        branch (n == 0) => 'done;
+        alt n -= 1;
+        branch => 'loop;
+    }
+    label (done) { syscall; }
+}
+"#,
+        );
+        let body = &m.bodies[0];
+        let graph = cfg::build(&m, body);
+        let statics = static_facts(&m);
+        let ctx = Ctx { module: &m, statics: &statics };
+        let entries = entry_states(body, &graph, &ctx);
+        // every block got an entry state (reachable) and widening converged
+        assert_eq!(entries.len(), graph.blocks.len());
+        // the loop body sees n's interval widened, not diverged to a panic
+        let diags = verify(&m);
+        let ks = kinds(&diags);
+        assert_eq!(verify_errors(&diags), 0, "{ks:?}");
+    }
+
+    #[test]
+    fn interval_facts_track_mov_add() {
+        // div by a register the analysis knows is exactly 5 → no diagnostic
+        let diags = verify_of(
+            r#"
+#[entry]
+fn main() -> ! {
+    bind mut a @ rax: u64 = 100;
+    bind mut d @ rbx: u64 = 2;
+    alt d += 3;
+    alt rdx:rax = a as u128;
+    alt (rax, rdx) = rdx:rax /% d;
+    syscall;
+}
+"#,
+        );
+        assert!(
+            !kinds(&diags).contains(&"verify-div-zero"),
+            "{:?}",
+            kinds(&diags)
+        );
+    }
+
+    // ---- z3 bridge (SMT emitter — text-level, no binary needed) ----
+
+    fn int(v: i128) -> ConstExpr {
+        ConstExpr::Int { value: v, span: Span::new(0, 0) }
+    }
+    fn name(s: &str) -> ConstExpr {
+        ConstExpr::Name { name: s.to_string(), span: Span::new(0, 0) }
+    }
+    fn bin(op: ConstBinOp, a: ConstExpr, b: ConstExpr) -> ConstExpr {
+        ConstExpr::Binary { op, lhs: Box::new(a), rhs: Box::new(b), span: Span::new(0, 0) }
+    }
+    fn un(op: ConstUnOp, a: ConstExpr) -> ConstExpr {
+        ConstExpr::Unary { op, expr: Box::new(a), span: Span::new(0, 0) }
+    }
+
+    #[test]
+    fn smt_emitter_shapes() {
+        assert_eq!(smt_of(&int(5)).unwrap(), "5");
+        assert_eq!(smt_of(&int(-7)).unwrap(), "(- 7)");
+        assert_eq!(smt_of(&ConstExpr::Bool { value: true, span: Span::new(0, 0) }).unwrap(), "true");
+        assert_eq!(smt_of(&name("n")).unwrap(), "v_n");
+        // requires n > 0
+        assert_eq!(
+            smt_of(&bin(ConstBinOp::Gt, name("n"), int(0))).unwrap(),
+            "(> v_n 0)"
+        );
+        // ensures (rax >= 100) && (n != 0)
+        let e = bin(
+            ConstBinOp::And,
+            bin(ConstBinOp::Ge, name("rax"), int(100)),
+            bin(ConstBinOp::Ne, name("n"), int(0)),
+        );
+        assert_eq!(
+            smt_of(&e).unwrap(),
+            "(and (>= v_rax 100) (not (= v_n 0)))"
+        );
+        // arithmetic: (n + 1) * (-2)
+        assert_eq!(
+            smt_of(&bin(ConstBinOp::Mul, bin(ConstBinOp::Add, name("n"), int(1)), un(ConstUnOp::Neg, int(2)))).unwrap(),
+            "(* (+ v_n 1) (- 2))"
+        );
+        // shl by a const becomes a multiplication (QF_NIA has no shifts)
+        assert_eq!(
+            smt_of(&bin(ConstBinOp::Shl, name("n"), int(3))).unwrap(),
+            "(* v_n 8)"
+        );
+        assert_eq!(
+            smt_of(&bin(ConstBinOp::Shr, name("n"), int(2))).unwrap(),
+            "(div v_n 4)"
+        );
+        // bitwise ops have no encoding → None (D9)
+        assert!(smt_of(&bin(ConstBinOp::BitAnd, name("n"), int(3))).is_none());
+        // div/mod map to SMT div/mod
+        assert_eq!(smt_of(&bin(ConstBinOp::Div, name("n"), int(3))).unwrap(), "(div v_n 3)");
+        assert_eq!(smt_of(&bin(ConstBinOp::Rem, name("n"), int(3))).unwrap(), "(mod v_n 3)");
+    }
+
+    #[test]
+    fn extract_value_parses_z3_model() {
+        let text = "sat\n((v_n 0)\n (v_rax (- 5)))\n";
+        assert_eq!(extract_value(text, "v_n").unwrap(), "0");
+        assert_eq!(extract_value(text, "v_rax").unwrap(), "(- 5)");
+        assert!(extract_value(text, "v_missing").is_none());
+    }
 }
