@@ -11,7 +11,7 @@ pub mod place;
 pub mod ast;
 pub mod diag;
 
-pub use span::Span;
+pub use span::{Span, Sp};
 pub use reg::{Reg, GprBase, RegSize};
 pub use ty::Ty;
 pub use place::{Place, MemAddr, SectionKind};

@@ -1,0 +1,10 @@
+
+#[entry]
+fn main() -> ! {
+    bind mut a @ rax: u64 = 100;
+    bind mut d @ rbx: u64 = 3;
+    alt d -= 3;
+    alt rdx:rax = a as u128;
+    alt (rax, rdx) = rdx:rax /% d;
+    syscall;
+}

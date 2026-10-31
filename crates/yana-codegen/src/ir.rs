@@ -59,6 +59,9 @@ pub struct Symbol {
     /// ABI default rcx/r11); functions derive it from the body in the
     /// analysis pass and this field is filled in afterwards.
     pub clobbers: Vec<Reg>,
+    /// §14.4 minimal contracts (`requires`/`ensures`) — pass 4 reads these
+    /// by symbol index at call sites and function exits.
+    pub contracts: FnContracts,
     pub span: Span,
 }
 
@@ -111,6 +114,34 @@ pub struct FnBody {
     /// end is expected (it should end in a noreturn call/syscall), so the
     /// fallthrough check is suppressed and a reachable plain `ret` is flagged.
     pub returns_never: bool,
+}
+
+/// The §14.4 contract clauses of one function symbol, resolved to IR-level
+/// data. Lives on [`Symbol`] (not [`FnBody`]) so call-site checks find the
+/// callee's contracts by symbol index — externs have no body.
+///
+/// Expressions keep the [`yana_ast::ConstExpr`] shape; identifiers inside
+/// them name parameters (`requires`/`ensures`) or result registers
+/// (`ensures` only). [`FnContracts::params`]/[`FnContracts::results`] give
+/// the verifier the name → register mapping.
+#[derive(Debug, Clone, Default)]
+pub struct FnContracts {
+    /// `requires <expr>;` clauses with their source spans.
+    pub requires: Vec<(yana_ast::ConstExpr, Span)>,
+    /// `ensures <expr>;` clauses with their source spans.
+    pub ensures: Vec<(yana_ast::ConstExpr, Span)>,
+    /// Parameter name → register (signature order; non-register places are
+    /// omitted — they cannot carry integer contract values).
+    pub params: Vec<(String, Reg)>,
+    /// Result name → register for `ensures` idents: the ret-sig binding name
+    /// (`-> (lo @ rax: u64, ...)`) or the bare register name (`-> rax: u64`).
+    pub results: Vec<(String, Reg)>,
+}
+
+impl FnContracts {
+    pub fn is_empty(&self) -> bool {
+        self.requires.is_empty() && self.ensures.is_empty()
+    }
 }
 
 /// An instruction plus its source span and trivia comment (§14: "спаны и

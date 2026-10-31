@@ -742,3 +742,104 @@ fn f() {
         dead.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
+
+// ---------------------------------------------------------------------------
+// §14.4 contracts: resolve plumbing (names validated at resolve time)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn contracts_resolve_into_symbol() {
+    let src = r#"
+fn f(n @ rdi: u64) -> rax: u64
+requires n != 0;
+ensures rax >= 0;
+{
+    return;
+}
+"#;
+    let (module, diags) = resolve(src);
+    assert!(
+        !diags.iter().any(|d| matches!(d.level, yana_ast::DiagLevel::Error)),
+        "{:?}",
+        diags.iter().map(|d| (&d.kind, &d.message)).collect::<Vec<_>>()
+    );
+    let sym = module.find("f").expect("symbol f");
+    let c = &module.symbols[sym].contracts;
+    assert_eq!(c.requires.len(), 1);
+    assert_eq!(c.ensures.len(), 1);
+    assert_eq!(c.params, vec![("n".to_string(), yana_ast::Reg::parse("rdi").unwrap())]);
+    assert_eq!(c.results, vec![("rax".to_string(), yana_ast::Reg::parse("rax").unwrap())]);
+}
+
+#[test]
+fn contract_unknown_ident_is_error() {
+    let src = r#"
+fn f(n @ rdi: u64) -> rax: u64
+requires m != 0;
+{
+    return;
+}
+"#;
+    let (_, diags) = resolve(src);
+    let d = diags
+        .iter()
+        .find(|d| d.kind == "verify-contract-name")
+        .expect("verify-contract-name diagnostic");
+    assert!(matches!(d.level, yana_ast::DiagLevel::Error));
+    assert!(d.message.contains('m'), "{}", d.message);
+    assert!(d.help.as_deref().unwrap().contains('n'), "{:?}", d.help);
+}
+
+#[test]
+fn contract_ensures_result_binding_name_allowed() {
+    // tuple ret-sig: ensures may name the binding (`lo`) or the reg (`rax`)
+    let src = r#"
+fn f(n @ rdi: u64) -> (lo @ rax: u64, hi @ rdx: u64)
+ensures lo >= 0;
+ensures rdx >= hi;
+{
+    return;
+}
+"#;
+    let (_, diags) = resolve(src);
+    assert!(
+        !diags.iter().any(|d| matches!(d.level, yana_ast::DiagLevel::Error)),
+        "{:?}",
+        diags.iter().map(|d| (&d.kind, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn contract_ensures_result_name_rejected_in_requires() {
+    // result regs are NOT in scope for requires (value at entry, not exit)
+    let src = r#"
+fn f(n @ rdi: u64) -> rax: u64
+requires rax != 0;
+{
+    return;
+}
+"#;
+    let (_, diags) = resolve(src);
+    assert!(
+        diags.iter().any(|d| d.kind == "verify-contract-name"),
+        "{:?}",
+        diags.iter().map(|d| (&d.kind, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn contract_unsupported_shape_is_error() {
+    let src = r#"
+fn f(n @ rdi: u64) -> rax: u64
+requires [n, n] != 0;
+{
+    return;
+}
+"#;
+    let (_, diags) = resolve(src);
+    assert!(
+        diags.iter().any(|d| d.kind == "verify-contract-expr"),
+        "{:?}",
+        diags.iter().map(|d| (&d.kind, &d.message)).collect::<Vec<_>>()
+    );
+}

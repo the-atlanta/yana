@@ -16,8 +16,8 @@ pub mod target;
 pub mod resolve;
 
 pub use ir::{
-    AtomicOp, DataItem, Displacement, FnBody, Insn, Jcc, LabelDef, MemOp, MemOrder, Module,
-    Operand, SectionData, Symbol, SymbolKind, WideOp,
+    AtomicOp, DataItem, Displacement, FnBody, FnContracts, Insn, Jcc, LabelDef, MemOp, MemOrder,
+    Module, Operand, SectionData, Symbol, SymbolKind, WideOp,
 };
 pub use target::{Arch, ImportedDecl, Os, ResolveOptions, TargetInfo};
 pub use resolve::resolve_module;

@@ -6,3 +6,4 @@ Cargo.lock
 zed-extension/target
 zed-extension/grammars/yana/node_modules
 *.exe
+.scratch/

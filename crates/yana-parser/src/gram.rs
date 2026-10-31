@@ -40,18 +40,9 @@ impl WithSpan for Token {
     }
 }
 
-/// A parsed payload token plus its source span.
-#[derive(Debug, Clone)]
-pub struct Sp<T> {
-    pub v: T,
-    pub span: Span,
-}
-
-impl Sp<String> {
-    pub fn len_from(&self) -> Span {
-        self.span
-    }
-}
+/// A parsed payload token plus its source span. Re-exported from `yana_ast`
+/// (moved there so AST contract types can carry spanned expressions).
+pub use yana_ast::Sp;
 
 /// Parse an integer literal (dec/hex/bin, `_` separators allowed).
 pub fn parse_int(s: &str, span: Span) -> Result<i128, PErr> {
@@ -206,6 +197,7 @@ pub fn fn_item(
     params: Vec<Param>,
     ret: RetSig,
     clobbers: Option<yana_ast::Clobbers>,
+    contracts: yana_ast::Contracts,
     body: Block,
     lo: usize,
     hi: usize,
@@ -221,6 +213,7 @@ pub fn fn_item(
             span: Span::new(lo as u32, hi as u32),
         },
         clobbers,
+        contracts,
         body,
         span: Span::new(lo as u32, hi as u32),
     }
@@ -234,6 +227,7 @@ pub fn extern_fn_item(
     params: Vec<Param>,
     ret: RetSig,
     clobbers: Option<yana_ast::Clobbers>,
+    contracts: yana_ast::Contracts,
     lo: usize,
     hi: usize,
 ) -> ExternFnItem {
@@ -248,8 +242,32 @@ pub fn extern_fn_item(
             span: Span::new(lo as u32, hi as u32),
         },
         clobbers,
+        contracts,
         span: Span::new(lo as u32, hi as u32),
     }
+}
+
+/// One §14.4 contract clause: `requires <expr>;` or `ensures <expr>;`.
+pub fn contract_clause(kind: ContractKind, e: ConstExpr, lo: usize, hi: usize) -> (ContractKind, Sp<ConstExpr>) {
+    (kind, Sp { v: e, span: Span::new(lo as u32, hi as u32) })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContractKind {
+    Requires,
+    Ensures,
+}
+
+/// Fold parsed clauses into a [`yana_ast::Contracts`].
+pub fn contracts_of(clauses: Vec<(ContractKind, Sp<ConstExpr>)>) -> yana_ast::Contracts {
+    let mut c = yana_ast::Contracts::default();
+    for (kind, sp) in clauses {
+        match kind {
+            ContractKind::Requires => c.requires.push(sp),
+            ContractKind::Ensures => c.ensures.push(sp),
+        }
+    }
+    c
 }
 
 /// Build a static bind item.

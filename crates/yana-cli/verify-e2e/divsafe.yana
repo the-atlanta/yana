@@ -1,0 +1,14 @@
+
+#[syscall(60)]
+extern fn exit(code @ rdi: u64) -> !;
+
+#[entry]
+fn main() -> ! {
+    bind mut a @ rax: u64 = 100;
+    bind mut d @ rbx: u64 = 7;
+    branch (d == 0) => 'bye;
+    alt rdx:rax = a as u128;
+    alt (rax, rdx) = rdx:rax /% d;
+    branch => 'bye;
+    label (bye) { call exit { code: 0 }; }
+}

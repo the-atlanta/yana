@@ -19,6 +19,7 @@ pub mod liveness;
 pub mod scope;
 pub mod stack;
 pub mod result;
+pub mod verify;
 
 use yana_ast::Diagnostic;
 use yana_codegen::Module;
