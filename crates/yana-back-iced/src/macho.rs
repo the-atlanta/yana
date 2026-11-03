@@ -358,7 +358,7 @@ mod tests {
     fn writes_macho_header_and_sections() {
         let b = obj(
             r#"
-fn f() { alt rax = 1; return; }
+fn f() { bind _ @ rax: u64 = 1; return; }
 "#,
         );
         assert_eq!(u32_at(&b, 0), MH_MAGIC_64);

@@ -85,6 +85,9 @@ struct Resolver {
 
     // current function state
     scopes: Vec<HashMap<String, Binding>>,
+    /// Snapshot of [`FnBody::reg_names`] per scope, restored on `pop_scope` so
+    /// a shadowed binding in a nested block does not leak its register name.
+    reg_names_stack: Vec<HashMap<Reg, String>>,
     /// Group aliases visible at each scope level (§3). Separate namespace from
     /// `scopes`: a group is a compile-time list of places, not a value.
     group_scopes: Vec<HashMap<String, GroupDef>>,
@@ -303,6 +306,7 @@ impl Resolver {
             struct_consts: HashMap::new(),
             fns: HashMap::new(),
             scopes: Vec::new(),
+            reg_names_stack: Vec::new(),
             group_scopes: Vec::new(),
             global_groups: HashMap::new(),
             stack_slots: HashMap::new(),
@@ -1318,7 +1322,11 @@ impl Resolver {
             }
         }
 
+        // The function scope itself is not a nested block: keep its
+        // `reg_names` map (nested scopes already restored their snapshots).
+        let reg_names = self.body.reg_names.clone();
         self.pop_scope();
+        self.body.reg_names = reg_names;
         if !self.has_errors() {
             let body_index = self.module.bodies.len();
             self.module.bodies.push(std::mem::take(&mut self.body));
@@ -1379,12 +1387,16 @@ impl Resolver {
     }
 
     fn push_scope(&mut self) {
+        self.reg_names_stack.push(self.body.reg_names.clone());
         self.scopes.push(HashMap::new());
         self.group_scopes.push(HashMap::new());
     }
     fn pop_scope(&mut self) {
         self.scopes.pop();
         self.group_scopes.pop();
+        if let Some(saved) = self.reg_names_stack.pop() {
+            self.body.reg_names = saved;
+        }
     }
     fn define(&mut self, name: String, b: Binding) {
         if let Some(top) = self.scopes.last_mut() {
@@ -1470,30 +1482,19 @@ impl Resolver {
                 // `_` is the discard (Rust convention, SPEC §11 ✅): rebindable,
                 // holds no name and no register; its writes are intentional sinks.
                 let is_wildcard = name == "_";
-                // duplicate name in same scope?
-                if !is_wildcard
-                    && self.scopes.last().map(|s| s.contains_key(&name)).unwrap_or(false)
-                {
-                    let first_span = self
-                        .scopes
-                        .last()
-                        .and_then(|s| s.get(&name))
-                        .map(|b| b.span)
-                        .unwrap_or(*name_span);
-                    self.diagnostics.push(
-                        Diagnostic::error(
-                            DiagCode::Semantic,
-                            "dup-bind",
-                            format!("`{name}` is already bound in this scope"),
-                            *name_span,
-                        )
-                        .with_primary_label("re-bound here")
-                        .with_label(format!("`{name}` is first bound here"), first_span, false)
-                        .with_help(
-                            "bindings live to the end of the block: wrap the earlier one in a \
-                             nested `{ ... }` block, rename it, or use `_` if the value is a discard",
-                        ),
-                    );
+                // Shadowing (§3): a later `bind name` replaces the earlier one,
+                // even in the same scope (Rust `let`-style). Retire the old
+                // binding's register name so liveness does not keep a stale
+                // mapping; the old value becomes inaccessible.
+                if !is_wildcard {
+                    if let Some(old) = self.scopes.last().and_then(|s| s.get(&name)).cloned() {
+                        if let Operand::Reg(r) = &old.operand {
+                            let r64 = r.resize(yana_ast::reg::RegSize::R64).unwrap_or(*r);
+                            if self.body.reg_names.get(&r64) == Some(&name) {
+                                self.body.reg_names.remove(&r64);
+                            }
+                        }
+                    }
                 }
                 // §3 🟡 two names on one register at once is an error
                 if !is_wildcard {
@@ -1523,8 +1524,9 @@ impl Resolver {
                                 )
                                 .with_help(
                                     "a binding holds its register until the end of the block even \
-                                     after its last use: close the earlier binding in a nested \
-                                     `{ ... }` block, or bind the value to `_`",
+                                     after its last use: shadow the earlier name with a new \
+                                     `bind`, close it in a nested `{ ... }` block, or bind the \
+                                     value to `_`",
                                 ),
                             );
                         }
@@ -1766,6 +1768,23 @@ impl Resolver {
         self.emit(Insn::Ud2);
     }
 
+    /// Is `r` already declared/used by this function? Parameters and result
+    /// registers count, as does any earlier `bind` (including `bind _`).
+    fn register_bound(&self, r: &Reg) -> bool {
+        let r64 = r.resize(yana_ast::reg::RegSize::R64).unwrap_or(*r);
+        if self.body.result_regs.contains(&r64) || self.body.reg_names.contains_key(&r64) {
+            return true;
+        }
+        self.scopes.iter().rev().any(|s| {
+            s.values().any(|b| match &b.operand {
+                Operand::Reg(br) => {
+                    br.resize(yana_ast::reg::RegSize::R64).unwrap_or(*br) == r64
+                }
+                _ => false,
+            })
+        })
+    }
+
     fn lower_alt(&mut self, dst: &Place, op: AssignOp, src: &Value, modifier: &AltModifier, span: Span) {
         // A group destination is an alias for several places: `alt g = b"...";`
         // (also via a name bound with `bind n @ group(g)`).
@@ -1822,6 +1841,20 @@ impl Resolver {
                     return;
                 }
                 _ => {}
+            }
+        }
+        // §4.2: `alt` mutates a place that already exists. A raw register is
+        // only writable after it has been declared with `bind` (or is part of
+        // the function's parameters/results) — no implicit register writes.
+        if let Place::Reg { reg, span: rspan, .. } = dst {
+            if !self.register_bound(reg) {
+                self.err_help(
+                    "alt-unbound-reg",
+                    format!("`{}` is not bound here; `alt` mutates existing places (§4.2)", reg.name()),
+                    format!("declare it first: `bind mut name @ {}: u64 = <initial>;`", reg.name()),
+                    *rspan,
+                );
+                return;
             }
         }
         let operand = match self.resolve_place(dst) {

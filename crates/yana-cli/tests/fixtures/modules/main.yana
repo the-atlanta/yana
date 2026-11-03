@@ -15,8 +15,8 @@ use math::BASE;
 fn main() -> ! {
     // the imported signature says the result lands in rax
     bind r = call add10 { n: 7 };
-    alt rdi = r;
-    alt rdi += BASE;
-    alt rdi += 52;
+    bind mut code @ rdi: u64 = r;
+    alt code += BASE;
+    alt code += 52;
     call exit { code: rdi @ rdi };
 }

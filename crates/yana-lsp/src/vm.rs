@@ -949,7 +949,7 @@ mod tests {
                     branch => 'loop;
                 }
                 label (done) {
-                    alt rdi = acc;
+                    bind _ @ rdi: u64 = acc;
                     call exit { code: rdi @ rdi };
                 }
             }

@@ -826,17 +826,21 @@ impl LanguageServer for Backend {
                         )));
                     }
                 }
-                "dup-bind" => {
-                    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                        title: "Rename one of the conflicting bindings".into(),
-                        kind: Some(CodeActionKind::REFACTOR),
-                        diagnostics: Some(vec![diag.clone()]),
-                        edit: None,
-                        command: None,
-                        is_preferred: Some(false),
-                        disabled: None,
-                        data: None,
-                    }));
+                "alt-unbound-reg" => {
+                    if let Some(reg) = extract_bind_name(&diag.message) {
+                        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                            title: format!(
+                                "Declare `{reg}` first: `bind mut name @ {reg}: u64 = ...;`"
+                            ),
+                            kind: Some(CodeActionKind::REFACTOR),
+                            diagnostics: Some(vec![diag.clone()]),
+                            edit: None,
+                            command: None,
+                            is_preferred: Some(false),
+                            disabled: None,
+                            data: None,
+                        }));
+                    }
                 }
                 "type-mismatch" => {
                     if let Some((name, expected, found)) = extract_type_mismatch(&diag.message) {

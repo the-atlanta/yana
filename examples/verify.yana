@@ -27,8 +27,8 @@ ensures rax <= 100;
 #[entry]
 fn main() -> ! {
     bind mut d @ rsi: u64 = 5;
-    alt rax = 100;
-    alt rdx = 0;
+    bind mut num @ rax: u64 = 100;
+    bind mut rem @ rdx: u64 = 0;
 
     branch (d == 0) => 'bad;
     // rdx:rax = 0:100 / d — safe: this edge knows d ≠ 0
@@ -39,7 +39,7 @@ fn main() -> ! {
 
     label (done) {
         bind q = call quot { n: rax, d: d };
-        alt rdi = q;
+        bind code @ rdi: u64 = q;
         call exit { code: rdi @ rdi };
     }
 }

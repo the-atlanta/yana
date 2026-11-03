@@ -768,29 +768,38 @@ fn f() {
 }
 
 #[test]
-fn dup_bind_labels_point_at_both_sites() {
+fn bind_shadows_previous_binding_in_same_scope() {
+    // §3: a later `bind name` replaces the earlier one, Rust `let`-style.
+    // The old register is retired from `reg_names`; no `dup-bind` fires.
     let src = r#"
-fn f() {
-    bind a @ rax: u64 = 1;
-    bind a @ rcx: u64 = 2;
+fn f() -> rax: u64 {
+    bind mut n @ rcx: u64 = 1;
+    alt n += 1;
+    bind mut n @ rdx: u64 = 10;
+    alt n += 2;
+    alt rax = n;
     return;
 }
 "#;
-    let (_, diags) = resolve(src);
-    let d = diags.iter().find(|d| d.kind == "dup-bind").expect("dup-bind expected");
-    // primary label has text (no empty `╰──`) and a secondary points at the first bind
-    let primary = d.labels.iter().find(|l| l.primary).unwrap();
-    assert!(!primary.message.is_empty(), "primary label must carry text");
-    let secondary = d.labels.iter().find(|l| !l.primary).expect("secondary label expected");
+    let (module, diags) = resolve(src);
     assert!(
-        secondary.message.contains("first bound here") && secondary.message.contains("`a`"),
-        "secondary label: {:?}",
-        secondary.message
+        !diags.iter().any(|d| matches!(d.level, yana_ast::DiagLevel::Error)),
+        "same-scope shadowing must be legal: {:?}",
+        diags.iter().map(|d| (&d.kind, &d.message)).collect::<Vec<_>>()
     );
-    // secondary span is the FIRST bind statement (earlier in the source)
-    assert!(secondary.span.lo < primary.span.lo, "secondary must point backwards");
-    let help = d.help.as_deref().unwrap();
-    assert!(help.contains("{ ... }") && help.contains("`_`"), "help must offer block/`_`: {help}");
+    let body = &module.bodies[0];
+    let rcx = yana_ast::Reg::parse("rcx").unwrap();
+    let rdx = yana_ast::Reg::parse("rdx").unwrap();
+    assert!(!body.reg_names.contains_key(&rcx), "shadowed register retired: {:?}", body.reg_names);
+    assert_eq!(body.reg_names.get(&rdx).map(String::as_str), Some("n"));
+
+    let text = yana_back_iced::assemble_text(&module, Some(yana_back_iced::Layout::default_x86_64()))
+        .expect("assemble");
+    let joined = yana_back_iced::disassemble(&text.text, 0).join("\n");
+    // both bindings still emit their moves; the final read uses the new one
+    assert!(joined.contains("mov rcx,1"), "{joined}");
+    assert!(joined.contains("mov rdx,0Ah") || joined.contains("mov rdx,10"), "{joined}");
+    assert!(joined.contains("mov rax,rdx"), "{joined}");
 }
 
 #[test]
@@ -992,7 +1001,7 @@ fn debug_block_is_skipped_in_release() {
     let src = r#"
 #[entry]
 fn main() -> ! {
-    debug { alt rdi = 7; }
+    debug { bind _ @ rdi: u64 = 7; }
     syscall;
 }
 "#;
@@ -1069,7 +1078,7 @@ const P: Point = Point(1, 2);
 bind p @ .rodata: Point = P;
 bind q @ .data: Point = Point(3, 4);
 #[entry]
-fn main() -> ! { alt rax = 60; alt rdi = 0; syscall; }
+fn main() -> ! { bind _ @ rax: u64 = 60; bind _ @ rdi: u64 = 0; syscall; }
 "#;
     let (module, diags) = resolve(src);
     assert!(
@@ -1098,7 +1107,7 @@ struct Outer { x: u8, inner: Inner, y: u16 }
 const O: Outer = Outer(0x11, Inner(0x22, 0x33333333), 0x4444);
 bind o @ .rodata: Outer = O;
 #[entry]
-fn main() -> ! { alt rax = 60; alt rdi = 0; syscall; }
+fn main() -> ! { bind _ @ rax: u64 = 60; bind _ @ rdi: u64 = 0; syscall; }
 "#;
     let (module, diags) = resolve(src);
     assert!(
@@ -1125,7 +1134,7 @@ fn struct_init_arity_is_error() {
 struct Point { x: u32, y: u32 }
 const P: Point = Point(1, 2, 3);
 #[entry]
-fn main() -> ! { alt rax = 60; alt rdi = 0; syscall; }
+fn main() -> ! { bind _ @ rax: u64 = 60; bind _ @ rdi: u64 = 0; syscall; }
 "#;
     let (_module, diags) = resolve(src);
     assert!(diags.iter().any(|d| d.kind == "struct-init-arity"), "{:?}", diags.iter().map(|d| &d.kind).collect::<Vec<_>>());
@@ -1137,7 +1146,7 @@ fn struct_cycle_is_error() {
 struct A { b: B }
 struct B { a: A }
 #[entry]
-fn main() -> ! { alt rax = 60; alt rdi = 0; syscall; }
+fn main() -> ! { bind _ @ rax: u64 = 60; bind _ @ rdi: u64 = 0; syscall; }
 "#;
     let (_module, diags) = resolve(src);
     assert!(diags.iter().any(|d| d.kind == "struct-cycle"), "{:?}", diags.iter().map(|d| &d.kind).collect::<Vec<_>>());
@@ -1153,7 +1162,7 @@ fn macos_target_emits_macho_object() {
 extern "C" fn ext();
 bind msg @ .rodata: [u8; 4] = b"abcd";
 #[entry]
-fn main() -> ! { call ext; alt rax = 60; alt rdi = 0; syscall; }
+fn main() -> ! { call ext; bind _ @ rax: u64 = 60; bind _ @ rdi: u64 = 0; syscall; }
 "#;
     let dir = std::env::temp_dir().join(format!("yana-macho-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1183,7 +1192,7 @@ fn main() -> ! { call ext; alt rax = 60; alt rdi = 0; syscall; }
 
 #[test]
 fn unsupported_target_is_a_clean_error() {
-    let src = "#[entry]\nfn main() -> ! { alt rax = 60; alt rdi = 0; syscall; }\n";
+    let src = "#[entry]\nfn main() -> ! { bind _ @ rax: u64 = 60; bind _ @ rdi: u64 = 0; syscall; }\n";
     let dir = std::env::temp_dir().join(format!("yana-target-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let input = dir.join("m.yana");

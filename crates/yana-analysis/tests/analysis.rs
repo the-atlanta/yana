@@ -52,7 +52,7 @@ fn balanced_push_pop_is_clean() {
         r#"
 fn f() -> rax: u64 {
     push { rbx };
-    alt rbx = 5;
+    bind _ @ rbx: u64 = 5;
     alt rax = rbx;
     pop { rbx };
     return;
@@ -192,7 +192,7 @@ fn derive_clobbers_lists_written_regs() {
     let m = module_of(
         r#"
 fn f() -> rax: u64 {
-    alt rcx = 1;
+    bind _ @ rcx: u64 = 1;
     alt rax = rcx;
     return;
 }

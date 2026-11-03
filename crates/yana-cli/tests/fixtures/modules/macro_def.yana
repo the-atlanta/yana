@@ -2,8 +2,8 @@
 
 #[global]
 macro exit_with(code: value) {
-    alt rax = 60;
-    alt rdi = code;
+    bind _ @ rax: u64 = 60;
+    bind _ @ rdi: u64 = code;
     syscall;
 }
 

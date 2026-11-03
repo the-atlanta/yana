@@ -25,7 +25,7 @@ clobbers:
 
 #[entry]
 fn main() -> ! {
-    alt rax = 1;
+    bind _ @ rax:u64 = 1;
 
     push { rax };
     
@@ -33,9 +33,9 @@ fn main() -> ! {
 
     push { rax };
 
-    bind n1 @ rax:u64 = 1;
+    bind n1 @ rbx:u64 = 1;
 
-    push { rax };
+    push { rbx };
     
     call say_hi_to_fd {
         fd : rax

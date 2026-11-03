@@ -15,7 +15,7 @@ fn main() -> ! {
     }
     label (done) {
         // acc = 120 → код возврата
-        alt rdi = acc;
+        bind code @ rdi: u64 = acc;
         call exit { code: rdi @ rdi };
     }
 }

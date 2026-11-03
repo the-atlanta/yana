@@ -13,7 +13,7 @@ fn main() -> ! {
         branch => 'out;
     }
     label (out) {
-        alt rax = 60;
+        bind nr @ rax: u64 = 60;
         syscall;
     }
 }

@@ -11,7 +11,7 @@ fn main() -> ! {
     alt atomic(relaxed) @[counter]: u64 += 3;
     alt atomic(relaxed) @[counter]: u64 += 4;
     alt atomic(relaxed) @[counter]: u64 += 5;
-    alt rax = [counter]: u64;
-    alt rdi = rax;
+    bind total @ rax: u64 = [counter]: u64;
+    bind code @ rdi: u64 = total;
     call exit { code: rdi @ rdi };
 }

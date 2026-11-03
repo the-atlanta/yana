@@ -124,7 +124,7 @@ fn main() -> ! {
     label (done) {
         cnt!(5);
         cnt!(7);
-        alt rax = 60;
+        bind _ @ rax: u64 = 60;
         syscall;
     }
 }
