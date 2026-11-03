@@ -38,5 +38,40 @@ pub fn analyze(module: &mut Module) -> Vec<Diagnostic> {
         diags.extend(result::check(module, body, &graph));
         diags.extend(liveness::check(module, body, &graph));
     }
+    diags.extend(preserves::check(module));
     diags
+}
+
+/// §5.4 `preserves`: a function that promises not to destroy a register must
+/// not write it (directly or through a call's clobber contract).
+pub mod preserves {
+    use crate::flags::norm64;
+    use yana_ast::{DiagCode, Diagnostic};
+    use yana_codegen::Module;
+
+    pub fn check(module: &Module) -> Vec<Diagnostic> {
+        let mut diags = Vec::new();
+        for body in &module.bodies {
+            let Some(sym) = module.symbols.get(body.symbol) else { continue };
+            if sym.preserves.is_empty() {
+                continue;
+            }
+            let derived = crate::liveness::derive_clobbers(module, body);
+            for p in &sym.preserves {
+                let p64 = norm64(*p);
+                if derived.iter().any(|d| norm64(*d) == p64) {
+                    diags.push(
+                        Diagnostic::error(
+                            DiagCode::Contract,
+                            "preserves-violated",
+                            format!("`{}` is declared `preserves`, but the body writes it", p64.name()),
+                            sym.span,
+                        )
+                        .with_help("remove the register from `preserves`, or stop writing it (§5.4)"),
+                    );
+                }
+            }
+        }
+        diags
+    }
 }

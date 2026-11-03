@@ -17,24 +17,68 @@ use yana_lexer::Token;
 /// A token triple: `(byte_lo, Token, byte_hi)`.
 type Triple = (usize, Token, usize);
 
+/// One declarative macro parameter. A variadic parameter (`name: kind..`)
+/// captures zero or more remaining invocation arguments (§9).
+#[derive(Debug, Clone)]
+struct MacroParam {
+    name: String,
+    kind: String,
+    variadic: bool,
+}
+
 /// What a macro is.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum MacroDef {
     /// `macro name(a: kind, ...) { body }` — positional/named.
     Declarative {
-        /// `(param_name, kind_str)`, in declaration order.
-        params: Vec<(String, String)>,
+        /// Parameters in declaration order; at most the last is variadic.
+        params: Vec<MacroParam>,
         /// Body token triples (between `{` and `}`).
         body: Vec<Triple>,
         /// Hygiene set: names declared via `bind`/`label` inside the body
         /// template (renamed on every expansion).
         hyg: Vec<String>,
+        /// Visible to `use` from another module (`#[global]`, §10).
+        exported: bool,
+        /// Body spans belong to another file; remap them to the invocation.
+        foreign: bool,
     },
     /// `macro_rules! name { (pat) => { body }; ... }`.
     Rules {
         /// One arm: (pattern token triples, body token triples, hygiene set).
         arms: Vec<RulesArm>,
+        /// Visible to `use` from another module (`#[global]`, §10).
+        exported: bool,
+        /// Body spans belong to another file; remap them to the invocation.
+        foreign: bool,
     },
+}
+
+impl MacroDef {
+    fn is_exported(&self) -> bool {
+        match self {
+            MacroDef::Declarative { exported, .. } | MacroDef::Rules { exported, .. } => *exported,
+        }
+    }
+
+    fn is_foreign(&self) -> bool {
+        match self {
+            MacroDef::Declarative { foreign, .. } | MacroDef::Rules { foreign, .. } => *foreign,
+        }
+    }
+}
+
+/// A macro declaration captured from another module for `use` import (§10).
+#[derive(Debug, Clone)]
+pub struct MacroExport {
+    name: String,
+    def: MacroDef,
+}
+
+impl MacroExport {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +108,13 @@ pub struct ExpandResult {
 
 /// Run the macro pre-pass on a token triple stream.
 pub fn expand(triples: Vec<Triple>) -> ExpandResult {
+    expand_with_prelude(triples, &[])
+}
+
+/// Run the pre-pass with macros imported from other modules already in scope
+/// (§10). Prelude definitions are inserted first, so a local macro of the same
+/// name overrides the import (matching the loader's duplicate-import rule).
+pub fn expand_with_prelude(triples: Vec<Triple>, prelude: &[MacroExport]) -> ExpandResult {
     let mut ctx = Ctx {
         defs: HashMap::new(),
         def_order: Vec::new(),
@@ -72,6 +123,18 @@ pub fn expand(triples: Vec<Triple>) -> ExpandResult {
         exp_counter: 0u64,
         defined_names: Vec::new(),
     };
+
+    for exp in prelude {
+        let mut def = exp.def.clone();
+        match &mut def {
+            MacroDef::Declarative { foreign, .. } | MacroDef::Rules { foreign, .. } => {
+                *foreign = true;
+            }
+        }
+        ctx.defs.insert(exp.name.clone(), def);
+        ctx.def_order.push(exp.name.clone());
+        ctx.defined_names.push(exp.name.clone());
+    }
 
     // 1. Extract declarations.
     let after_decls = extract_declarations(triples, &mut ctx);
@@ -125,48 +188,54 @@ fn extract_declarations(triples: Vec<Triple>, ctx: &mut Ctx) -> Vec<Triple> {
     let mut out: Vec<Triple> = Vec::with_capacity(triples.len());
     let mut i = 0;
     while i < triples.len() {
-        let is_macro = matches!(triples[i].1, Token::KwMacro);
+        // `#[global] macro ...` — attributes are part of the declaration, not
+        // items the grammar should see.
+        let (decl_at, exported) = match attr_prefix(&triples, i) {
+            Some((at, global)) => (at, global),
+            None => (i, false),
+        };
+
+        let is_macro = matches!(triples.get(decl_at).map(|t| &t.1), Some(Token::KwMacro));
         let is_macro_rules =
-            matches!(triples[i].1, Token::KwMacroRules)
-            && i + 1 < triples.len()
-            && matches!(triples[i + 1].1, Token::Bang);
+            matches!(triples.get(decl_at).map(|t| &t.1), Some(Token::KwMacroRules))
+            && matches!(triples.get(decl_at + 1).map(|t| &t.1), Some(Token::Bang));
 
         if is_macro {
             // `macro Ident ( params ) { body }`
-            match try_parse_declarative(&triples, i, ctx) {
+            match try_parse_declarative(&triples, decl_at, ctx, exported) {
                 Some((consumed, name, def)) => {
                     ctx.defs.insert(name.clone(), def);
                     ctx.def_order.push(name.clone());
                     ctx.defined_names.push(name);
-                    i += consumed;
+                    i = decl_at + consumed;
                     continue;
                 }
                 None => {
                     // If we saw `macro` but couldn't parse, emit a syntax
                     // error and skip the `macro` token so the parser doesn't
                     // choke on it (KwMacro is not in the grammar).
-                    let span = span_of(&triples[i]);
+                    let span = span_of(&triples[decl_at]);
                     ctx.err("macro-syntax", "malformed `macro` declaration", span);
-                    i += 1;
+                    i = decl_at + 1;
                     continue;
                 }
             }
         }
 
         if is_macro_rules {
-            match try_parse_rules(&triples, i, ctx) {
+            match try_parse_rules(&triples, decl_at, ctx, exported) {
                 Some((consumed, name, def)) => {
                     ctx.defs.insert(name.clone(), def);
                     ctx.def_order.push(name.clone());
                     ctx.defined_names.push(name);
-                    i += consumed;
+                    i = decl_at + consumed;
                     continue;
                 }
                 None => {
-                    let span = span_of(&triples[i]);
+                    let span = span_of(&triples[decl_at]);
                     ctx.err("macro-syntax", "malformed `macro_rules!` declaration", span);
                     // skip KwMacroRules + Bang
-                    i += 2;
+                    i = decl_at + 2;
                     continue;
                 }
             }
@@ -178,12 +247,97 @@ fn extract_declarations(triples: Vec<Triple>, ctx: &mut Ctx) -> Vec<Triple> {
     out
 }
 
+/// If an attribute run starts at `start`, return `(index of the first token
+/// after the attributes, has_#[global])`. `#[global]` before a macro makes it
+/// importable (§10).
+fn attr_prefix(triples: &[Triple], start: usize) -> Option<(usize, bool)> {
+    if !matches!(triples.get(start).map(|t| &t.1), Some(Token::HashLBracket)) {
+        return None;
+    }
+    let mut i = start;
+    let mut global = false;
+    while matches!(triples.get(i).map(|t| &t.1), Some(Token::HashLBracket)) {
+        let end = find_matching(triples, i + 1, &Token::LBracket, &Token::RBracket)?;
+        // `#[global]` or `#[global(...)]`; the first Ident is the attr name.
+        if let Some((_, Token::Ident(name), _)) = triples.get(i + 1) {
+            if name == "global" {
+                global = true;
+            }
+        }
+        i = end + 1;
+    }
+    Some((i, global))
+}
+
+/// Collect the macros a module exports with `#[global]` (§10). Used by the
+/// loader before parsing the importer, so imported invocations expand in pass
+/// 0.5 exactly like local ones.
+pub fn collect_exports(source: &str) -> Vec<MacroExport> {
+    collect_defs(source, true)
+}
+
+/// Does this module define a macro with `name` at all (exported or not)?
+/// Lets the loader distinguish "missing" from "not exported".
+pub fn defines_macro(source: &str, name: &str) -> bool {
+    collect_defs(source, false).iter().any(|e| e.name == name)
+}
+
+fn collect_defs(source: &str, only_exported: bool) -> Vec<MacroExport> {
+    let lexed = yana_lexer::lex(source);
+    let triples = yana_lexer::token_triples(&lexed);
+    let mut ctx = Ctx {
+        defs: HashMap::new(),
+        def_order: Vec::new(),
+        diags: Vec::new(),
+        comments: Vec::new(),
+        exp_counter: 0,
+        defined_names: Vec::new(),
+    };
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < triples.len() {
+        let (decl_at, exported) = match attr_prefix(&triples, i) {
+            Some((at, global)) => (at, global),
+            None => (i, false),
+        };
+        let is_macro = matches!(triples.get(decl_at).map(|t| &t.1), Some(Token::KwMacro));
+        let is_macro_rules = matches!(
+            triples.get(decl_at).map(|t| &t.1),
+            Some(Token::KwMacroRules)
+        ) && matches!(triples.get(decl_at + 1).map(|t| &t.1), Some(Token::Bang));
+        if is_macro {
+            if let Some((consumed, name, def)) =
+                try_parse_declarative(&triples, decl_at, &mut ctx, exported)
+            {
+                if !only_exported || def.is_exported() {
+                    out.push(MacroExport { name, def });
+                }
+                i = decl_at + consumed;
+                continue;
+            }
+        } else if is_macro_rules {
+            if let Some((consumed, name, def)) =
+                try_parse_rules(&triples, decl_at, &mut ctx, exported)
+            {
+                if !only_exported || def.is_exported() {
+                    out.push(MacroExport { name, def });
+                }
+                i = decl_at + consumed;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Try to parse `macro Ident ( params ) { body }` starting at `start`.
 /// Returns `(tokens_consumed, name, def)` on success.
 fn try_parse_declarative(
     triples: &[Triple],
     start: usize,
     ctx: &mut Ctx,
+    exported: bool,
 ) -> Option<(usize, String, MacroDef)> {
     // macro Ident
     let mut i = start + 1;
@@ -226,22 +380,40 @@ fn try_parse_declarative(
     Some((
         consumed,
         name,
-        MacroDef::Declarative { params, body, hyg: hyg },
+        MacroDef::Declarative { params, body, hyg, exported, foreign: false },
     ))
 }
 
-/// Parse `(a: kind, b: kind, ...)` — returns `(params, rparen_index)`.
+/// Parse `(a: kind, b: kind, rest: kind..)` — returns
+/// `(params, rparen_index)`. `..` (or `...`) marks the last parameter
+/// variadic: it captures zero or more comma-separated invocation arguments.
 fn parse_param_list(
     triples: &[Triple],
     start: usize,
     ctx: &mut Ctx,
-) -> Option<(Vec<(String, String)>, usize)> {
-    let mut params = Vec::new();
+) -> Option<(Vec<MacroParam>, usize)> {
+    let mut params: Vec<MacroParam> = Vec::new();
     let mut i = start;
     loop {
         // Either RParen (end) or Ident : kind
         match triples.get(i) {
-            Some((_, Token::RParen, _)) => return Some((params, i)),
+            Some((_, Token::RParen, _)) => {
+                if let Some(pos) = params.iter().position(|p| p.variadic) {
+                    if pos + 1 != params.len() {
+                        let span = triples
+                            .get(start.saturating_sub(1))
+                            .map(|t| Span::new(t.0 as u32, t.2 as u32))
+                            .unwrap_or(Span::DUMMY);
+                        ctx.err(
+                            "macro-syntax",
+                            "a variadic parameter must be the last one",
+                            span,
+                        );
+                        return None;
+                    }
+                }
+                return Some((params, i));
+            }
             Some((lo, Token::Ident(name), hi)) => {
                 let pname = name.clone();
                 i += 1;
@@ -278,7 +450,24 @@ fn parse_param_list(
                     return None;
                 }
                 i += 1;
-                params.push((pname, kind));
+                // `kind..` / `kind...` / `kind*` marks a variadic tail.
+                let mut variadic = false;
+                if let Some((_, Token::DotDot, _)) = triples.get(i) {
+                    variadic = true;
+                    i += 1;
+                    // `...`: DotDot + Dot (lexer's longest match).
+                    if let Some((_, Token::Dot, _)) = triples.get(i) {
+                        i += 1;
+                    }
+                } else if let Some((_, Token::Star, _)) = triples.get(i) {
+                    variadic = true;
+                    i += 1;
+                }
+                if variadic && !params.is_empty() {
+                    // Only the last parameter may be variadic; if another
+                    // parameter follows, the check below reports it.
+                }
+                params.push(MacroParam { name: pname, kind, variadic });
                 // optional comma
                 if let Some((_, Token::Comma, _)) = triples.get(i) {
                     i += 1;
@@ -302,6 +491,7 @@ fn try_parse_rules(
     triples: &[Triple],
     start: usize,
     ctx: &mut Ctx,
+    exported: bool,
 ) -> Option<(usize, String, MacroDef)> {
     // start is KwMacroRules; [start+1] is Bang
     let mut i = start + 2;
@@ -389,7 +579,7 @@ fn try_parse_rules(
     }
 
     let consumed = i - start;
-    Some((consumed, name, MacroDef::Rules { arms }))
+    Some((consumed, name, MacroDef::Rules { arms, exported, foreign: false }))
 }
 
 // =========================================================================
@@ -434,24 +624,6 @@ fn expand_one_pass(
         if let Some((_, Token::Ident(name), _)) = triples.get(i) {
             if let Some((_, Token::Bang, _)) = triples.get(i + 1) {
                 if ctx.defs.contains_key(name) {
-                    // Check statement position (§9.8): invocations are only
-                    // valid where a statement is expected, not at top level
-                    // where an item is expected.
-                    if is_item_position(triples, i) {
-                        let span = span_invocation(triples, i);
-                        ctx.err(
-                            "macro-item-position",
-                            format!("macro invocation `{name}!` at item position — macros are statement-position only"),
-                            span,
-                        );
-                        had_error = true;
-                        // Skip the invocation tokens to avoid infinite loop.
-                        // Skip name + bang + balanced group.
-                        let skip = skip_invocation(triples, i);
-                        i += skip;
-                        changed = true;
-                        continue;
-                    }
 
                     if depth >= 64 {
                         let span = span_invocation(triples, i);
@@ -499,15 +671,16 @@ fn expand_one_pass(
                         if matches!(tok, Token::LParen | Token::LBrace) {
                             let span = span_invocation(triples, i);
                             let suggestions = ctx.defined_names.join(", ");
+                            let hint = match yana_ast::text::closest(name, ctx.defined_names.iter().map(String::as_str)) {
+                                Some(s) => format!("did you mean `{s}`?"),
+                                None if suggestions.is_empty() => "no macros are defined in this file.".to_string(),
+                                None => format!("defined macros: {suggestions}"),
+                            };
                             ctx.err_with_help(
                                 "unknown-macro",
                                 format!("unknown macro `{name}`"),
                                 span,
-                                if suggestions.is_empty() {
-                                    "no macros are defined in this file.".to_string()
-                                } else {
-                                    format!("defined macros: {suggestions}")
-                                },
+                                hint,
                             );
                             had_error = true;
                             let skip = skip_invocation(triples, i);
@@ -539,11 +712,12 @@ fn expand_one_invocation(
     // Clone the arms we need (avoids borrowing ctx while expanding) — bodies
     // are cloned per-invocation; macro bodies are small.
     let arms: Vec<RulesArm> = match ctx.defs.get(name).unwrap() {
-        MacroDef::Rules { arms } => arms.to_vec(),
+        MacroDef::Rules { arms, .. } => arms.to_vec(),
         _ => Vec::new(),
     };
+    let foreign = ctx.defs.get(name).unwrap().is_foreign();
     let params_body = match ctx.defs.get(name).unwrap() {
-        MacroDef::Declarative { params, body, hyg } => {
+        MacroDef::Declarative { params, body, hyg, .. } => {
             Some((params.clone(), body.clone(), hyg.clone()))
         }
         _ => None,
@@ -581,7 +755,14 @@ fn expand_one_invocation(
         };
         // Substitute: replace param-name Ident tokens in the body with the
         // captured arg slice, then apply hygiene renaming.
-        let mut result = substitute_declarative(&body, &params, &args);
+        let mut result = match substitute_declarative(&body, &params, &args) {
+            Ok(r) => r,
+            Err(msg) => {
+                let span = span_invocation(triples, inv_start);
+                ctx.err("macro-arity", msg, span);
+                return Err(());
+            }
+        };
         apply_hygiene(&mut result, &hyg, exp_id);
         result
     } else {
@@ -622,55 +803,136 @@ fn expand_one_invocation(
         result
     };
 
+    let expanded = if foreign {
+        // Body tokens carry byte offsets from the defining module; this
+        // module's source map would misrender them. Point diagnostics inside
+        // an imported expansion at the invocation instead.
+        let (lo, hi) = (triples[inv_start].0, triples[inv_start].2);
+        expanded
+            .into_iter()
+            .map(|(_, tok, _)| (lo, tok, hi))
+            .collect()
+    } else {
+        expanded
+    };
+
     Ok((expanded, consumed))
 }
 
 // ---- declarative arg parsing ----
 
+/// Parsed declarative-macro arguments: fixed parameters plus an optional
+/// variadic tail (one token slice per extra argument).
+struct DeclarativeArgs {
+    fixed: Vec<Vec<Triple>>,
+    rest: Option<Vec<Vec<Triple>>>,
+}
+
 /// Split `raw_args` at top-level commas → positional arg slices.
 fn parse_positional_args(
     raw_args: &[Triple],
-    params: &[(String, String)],
+    params: &[MacroParam],
     triples: &[Triple],
     inv_start: usize,
     ctx: &mut Ctx,
-) -> Result<Vec<Vec<Triple>>, ()> {
-    let slices = split_top_level_commas(raw_args);
-    if slices.len() != params.len() {
-        let span = span_invocation(triples, inv_start);
-        ctx.err(
-            "macro-arity",
-            format!(
-                "macro expects {} argument(s), got {}",
-                params.len(),
-                slices.len()
-            ),
-            span,
-        );
-        return Err(());
+) -> Result<DeclarativeArgs, ()> {
+    let mut slices = split_top_level_commas(raw_args);
+    // A trailing comma produces an empty final slice; it is not an argument.
+    if matches!(raw_args.last().map(|t| &t.1), Some(Token::Comma)) {
+        slices.pop();
     }
-    // Validate kinds cheaply.
-    for (i, (slice, (_pname, kind))) in slices.iter().zip(params.iter()).enumerate() {
-        if let Err(msg) = validate_kind(kind, slice) {
-            let span = slice
-                .first()
-                .map(|t| Span::new(t.0 as u32, t.2 as u32))
-                .unwrap_or(Span::DUMMY);
-            ctx.err("macro-arity", format!("argument {i}: {msg}"), span);
-            return Err(());
+
+    let variadic_at = params.iter().position(|p| p.variadic);
+    match variadic_at {
+        None => {
+            if slices.len() != params.len() {
+                let span = span_invocation(triples, inv_start);
+                ctx.err(
+                    "macro-arity",
+                    format!(
+                        "macro expects {} argument(s), got {}",
+                        params.len(),
+                        slices.len()
+                    ),
+                    span,
+                );
+                return Err(());
+            }
+            for (i, (slice, param)) in slices.iter().zip(params.iter()).enumerate() {
+                if let Err(msg) = validate_kind(&param.kind, slice) {
+                    let span = slice
+                        .first()
+                        .map(|t| Span::new(t.0 as u32, t.2 as u32))
+                        .unwrap_or(Span::DUMMY);
+                    ctx.err("macro-arity", format!("argument {i}: {msg}"), span);
+                    return Err(());
+                }
+            }
+            Ok(DeclarativeArgs { fixed: slices, rest: None })
+        }
+        Some(vi) => {
+            if slices.len() < vi {
+                let span = span_invocation(triples, inv_start);
+                ctx.err(
+                    "macro-arity",
+                    format!(
+                        "macro expects at least {} argument(s), got {}",
+                        vi,
+                        slices.len()
+                    ),
+                    span,
+                );
+                return Err(());
+            }
+            let rest = slices.split_off(vi);
+            for (i, (slice, param)) in slices.iter().zip(params.iter()).enumerate() {
+                if let Err(msg) = validate_kind(&param.kind, slice) {
+                    let span = slice
+                        .first()
+                        .map(|t| Span::new(t.0 as u32, t.2 as u32))
+                        .unwrap_or(Span::DUMMY);
+                    ctx.err("macro-arity", format!("argument {i}: {msg}"), span);
+                    return Err(());
+                }
+            }
+            let kind = &params[vi].kind;
+            for (i, slice) in rest.iter().enumerate() {
+                if let Err(msg) = validate_kind(kind, slice) {
+                    let span = slice
+                        .first()
+                        .map(|t| Span::new(t.0 as u32, t.2 as u32))
+                        .unwrap_or(Span::DUMMY);
+                    ctx.err(
+                        "macro-arity",
+                        format!("variadic argument {i}: {msg}"),
+                        span,
+                    );
+                    return Err(());
+                }
+            }
+            Ok(DeclarativeArgs { fixed: slices, rest: Some(rest) })
         }
     }
-    Ok(slices)
 }
 
 /// Parse `{ a: x, b: y }` → map param_name → arg slice, in param order.
 fn parse_named_args(
     raw_args: &[Triple],
-    params: &[(String, String)],
+    params: &[MacroParam],
     triples: &[Triple],
     inv_start: usize,
     ctx: &mut Ctx,
-) -> Result<Vec<Vec<Triple>>, ()> {
+) -> Result<DeclarativeArgs, ()> {
+    if params.iter().any(|p| p.variadic) {
+        let span = span_invocation(triples, inv_start);
+        ctx.err_with_help(
+            "macro-arity",
+            "a variadic macro takes positional arguments only",
+            span,
+            "write `name!(a, b, c)` instead of `name! { a: ..., }`",
+        );
+        return Err(());
+    }
     let slices = split_top_level_commas(raw_args);
     let mut by_name: HashMap<String, Vec<Triple>> = HashMap::new();
     let mut seen: Vec<String> = Vec::new();
@@ -706,15 +968,19 @@ fn parse_named_args(
     }
     // Build in param order, checking all params are present and no unknowns.
     let mut result = Vec::new();
-    for (pname, kind) in params {
-        match by_name.get(pname) {
+    for param in params {
+        match by_name.get(&param.name) {
             Some(val) => {
-                if let Err(msg) = validate_kind(kind, val) {
+                if let Err(msg) = validate_kind(&param.kind, val) {
                     let span = val
                         .first()
                         .map(|t| Span::new(t.0 as u32, t.2 as u32))
                         .unwrap_or(Span::DUMMY);
-                    ctx.err("macro-arity", format!("argument `{pname}`: {msg}"), span);
+                    ctx.err(
+                        "macro-arity",
+                        format!("argument `{}`: {msg}", param.name),
+                        span,
+                    );
                     return Err(());
                 }
                 result.push(val.clone());
@@ -723,7 +989,7 @@ fn parse_named_args(
                 let span = span_invocation(triples, inv_start);
                 ctx.err(
                     "macro-arity",
-                    format!("missing argument `{pname}`"),
+                    format!("missing argument `{}`", param.name),
                     span,
                 );
                 return Err(());
@@ -732,34 +998,111 @@ fn parse_named_args(
     }
     // Check for unknown args.
     for s in &seen {
-        if !params.iter().any(|(p, _)| p == s) {
+        if !params.iter().any(|p| &p.name == s) {
             let span = span_invocation(triples, inv_start);
             ctx.err("macro-arity", format!("unknown argument `{s}`"), span);
             return Err(());
         }
     }
-    Ok(result)
+    Ok(DeclarativeArgs { fixed: result, rest: None })
 }
 
 // ---- declarative substitution ----
 
-/// Substitute param names in the body with captured arg slices.
+/// Substitute parameter names in the body with captured argument slices.
+///
+/// Variadic parameters splice all captured arguments comma-separated; inside
+/// `$( ... )*` / `$( ... ),*` / `$( ... )+` they splice one argument per
+/// repetition, so a declarative macro can repeat a statement per argument
+/// (the same shape as `macro_rules!` repetition).
 fn substitute_declarative(
     body: &[Triple],
-    params: &[(String, String)],
-    args: &[Vec<Triple>],
-) -> Vec<Triple> {
+    params: &[MacroParam],
+    args: &DeclarativeArgs,
+) -> Result<Vec<Triple>, String> {
+    substitute_declarative_rep(body, params, args, None)
+}
+
+fn substitute_declarative_rep(
+    body: &[Triple],
+    params: &[MacroParam],
+    args: &DeclarativeArgs,
+    rep: Option<usize>,
+) -> Result<Vec<Triple>, String> {
     let mut out = Vec::with_capacity(body.len());
-    for tok in body {
+    let mut i = 0;
+    while i < body.len() {
+        let tok = &body[i];
+
+        // Repetition: `$( ... ) sep? *|+`
+        if matches!(tok.1, Token::Dollar)
+            && matches!(body.get(i + 1).map(|t| &t.1), Some(Token::LParen))
+        {
+            let sub_start = i + 2;
+            let sub_end = find_matching(body, sub_start, &Token::LParen, &Token::RParen)
+                .ok_or_else(|| "unbalanced `$(` in macro body".to_string())?;
+            let subtemplate = &body[sub_start..sub_end];
+            let after = sub_end + 1;
+            let sep = body.get(after).filter(|t| matches!(t.1, Token::Comma));
+            let op = body.get(after + if sep.is_some() { 1 } else { 0 });
+            let min = match op.map(|t| &t.1) {
+                Some(Token::Star) => 0,
+                Some(Token::Plus) => 1,
+                _ => {
+                    return Err(
+                        "expected `*` or `+` after `$( ... )` in macro body".to_string()
+                    )
+                }
+            };
+            let count = args.rest.as_ref().map(|r| r.len()).unwrap_or(0);
+            if count < min {
+                return Err(
+                    "`$( ... )+` needs at least one variadic argument".to_string()
+                );
+            }
+            for r in 0..count {
+                if r > 0 {
+                    if let Some(sep) = sep {
+                        out.push(sep.clone());
+                    }
+                }
+                out.extend(substitute_declarative_rep(subtemplate, params, args, Some(r))?);
+            }
+            i = after + if sep.is_some() { 2 } else { 1 };
+            continue;
+        }
+
         if let Token::Ident(text) = &tok.1 {
-            if let Some(idx) = params.iter().position(|(p, _)| p == text) {
-                out.extend(args[idx].iter().cloned());
+            if let Some(pos) = params.iter().position(|p| &p.name == text) {
+                let param = &params[pos];
+                if param.variadic {
+                    let rest = args
+                        .rest
+                        .as_ref()
+                        .ok_or_else(|| "internal: missing variadic capture".to_string())?;
+                    match rep {
+                        Some(r) => out.extend(rest[r].iter().cloned()),
+                        None => {
+                            for (k, arg) in rest.iter().enumerate() {
+                                if k > 0 {
+                                    out.push((tok.0, Token::Comma, tok.2));
+                                }
+                                out.extend(arg.iter().cloned());
+                            }
+                        }
+                    }
+                } else {
+                    out.extend(args.fixed[pos].iter().cloned());
+                }
+                i += 1;
                 continue;
             }
         }
+
         out.push(tok.clone());
+        i += 1;
     }
-    out
+    Ok(out)
 }
 
 // ---- macro_rules pattern matching ----
@@ -1470,29 +1813,18 @@ fn skip_invocation(triples: &[Triple], inv_start: usize) -> usize {
     let open = &triples[inv_start + 2].1;
     let close = closing(open);
     if let Some(end) = find_matching(triples, inv_start + 3, open, close) {
-        (end + 1) - inv_start
+        // Consume the statement terminator too, so a failed expansion does
+        // not cascade into a second "unexpected `;`" parse error. This also
+        // keeps `use` detection working on the first parse of a file whose
+        // macros are imported from another module (§10).
+        let mut skip = (end + 1) - inv_start;
+        if let Some((_, Token::Semi, _)) = triples.get(end + 1) {
+            skip += 1;
+        }
+        skip
     } else {
         // Unbalanced — skip everything remaining.
         triples.len() - inv_start
     }
 }
 
-/// Determine if an invocation at `inv_start` is in "item position" (top level,
-/// where a declaration is expected — not inside a function body).
-///
-/// Heuristic: scan from 0 to `inv_start` tracking brace depth. Depth 0 at the
-/// invocation point means top level → item position.
-fn is_item_position(triples: &[Triple], inv_start: usize) -> bool {
-    // Scan from 0 to inv_start, tracking brace depth. If depth == 0 at
-    // inv_start, we're at top level → item position.
-    let mut depth = 0i32;
-    for k in 0..inv_start {
-        match &triples[k].1 {
-            Token::LBrace => depth += 1,
-            Token::RBrace => depth -= 1,
-            _ => {}
-        }
-    }
-    // Depth 0 at the invocation point means top-level → item position.
-    depth <= 0
-}

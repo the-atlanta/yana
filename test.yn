@@ -1,0 +1,47 @@
+#[syscall(1)]
+extern fn sys_write(
+    fd @ rdi: u64,
+    buf @ rsi: *u8,
+    len @ rdx: u64
+) -> rax: i64;
+
+#[syscall(60)]
+extern fn sys_exit(code @ rdi: u64) -> !;
+
+fn say_hi_to_fd(fd @ rdi: u64) -> rax:i64
+clobbers:
+    rax
+{
+    alt rax = b"Haii\n";
+    push { rax };
+    call sys_write {
+        fd: rdi @ rdi,
+        len: 5,
+        buf: rsp @ rsp
+    };
+    pop { _ };
+    return;
+}
+
+#[entry]
+fn main() -> ! {
+    alt rax = 1;
+
+    push { rax };
+    
+    bind n @ rax:u64 = 1;
+
+    push { rax };
+
+    bind n1 @ rax:u64 = 1;
+
+    push { rax };
+    
+    call say_hi_to_fd {
+        fd : rax
+    };
+
+    //breakpoint;
+
+    call sys_exit { code: 0 };
+}

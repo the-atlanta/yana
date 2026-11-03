@@ -10,6 +10,7 @@ pub mod ty;
 pub mod place;
 pub mod ast;
 pub mod diag;
+pub mod text;
 
 pub use span::{Span, Sp};
 pub use reg::{Reg, GprBase, RegSize};

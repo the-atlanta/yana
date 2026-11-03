@@ -299,6 +299,30 @@ fn use_may_mix_with_other_items() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn invariant_parses_with_contracts() {
+    let f = parse_ok(
+        r#"
+fn f(n @ rdi: u64) -> rax: u64
+requires n > 0;
+invariant n < 100;
+ensures rax >= n;
+{
+    return;
+}
+"#,
+    );
+    match &f.items[0] {
+        Item::Fn(f) => {
+            assert_eq!(f.contracts.requires.len(), 1);
+            assert_eq!(f.contracts.ensures.len(), 1);
+            assert_eq!(f.contracts.invariants.len(), 1);
+            assert!(!f.contracts.invariants[0].span.is_dummy());
+        }
+        _ => panic!("expected fn"),
+    }
+}
+
+#[test]
 fn contracts_parse_on_fn() {
     let src = r#"
 fn div(n @ rdi: u64, d @ rsi: u64) -> rax: u64
@@ -395,5 +419,142 @@ fn contract_expr_uses_const_precedence() {
             other => panic!("expected && at top, got {other:?}"),
         },
         other => panic!("expected fn, got {other:?}"),
+    }
+}
+
+#[test]
+fn group_declaration_parses() {
+    let file = parse_ok("group (buf) | rax, stack(16), rbx, stack |;");
+    match &file.items[0] {
+        Item::Group(g) => {
+            assert_eq!(g.name, "buf");
+            assert_eq!(g.places.len(), 4);
+            assert!(matches!(&g.places[0], Place::Reg { .. }));
+            assert!(matches!(&g.places[1], Place::Stack { size: Some(16), .. }));
+            assert!(matches!(&g.places[3], Place::Stack { size: None, .. }));
+        }
+        other => panic!("expected group, got {other:?}"),
+    }
+}
+
+#[test]
+fn bind_into_group_and_aligned_suffix_parse() {
+    let src = "fn f() { group (g) | rax, rbx |; bind s @ group(g) = b\"sex\".aligned; alt group(g) = b\"x\"; }";
+    let file = parse_ok(src);
+    match &file.items[0] {
+        Item::Fn(f) => {
+            assert!(matches!(f.body.stmts[0], Stmt::Group(_)));
+            match &f.body.stmts[1] {
+                Stmt::Bind { place: Place::Group { name, .. }, init: Some(Value::Field { name: field, .. }), .. } => {
+                    assert_eq!(name, "g");
+                    assert_eq!(field, "aligned");
+                }
+                other => panic!("expected group bind, got {other:?}"),
+            }
+            assert!(matches!(&f.body.stmts[2], Stmt::Alt { dst: Place::Group { .. }, .. }));
+        }
+        other => panic!("expected fn, got {other:?}"),
+    }
+}
+
+#[test]
+fn debug_statements_parse() {
+    let src = "fn f() { breakpoint; trap; assert (rax == 0); debug { alt rax = 1; } }";
+    let file = parse_ok(src);
+    match &file.items[0] {
+        Item::Fn(f) => {
+            assert!(matches!(f.body.stmts[0], Stmt::Breakpoint { .. }));
+            assert!(matches!(f.body.stmts[1], Stmt::Trap { .. }));
+            assert!(matches!(f.body.stmts[2], Stmt::Assert { cond: BranchCond::Cmp { .. }, .. }));
+            match &f.body.stmts[3] {
+                Stmt::Debug(b) => assert_eq!(b.stmts.len(), 1),
+                other => panic!("expected debug block, got {other:?}"),
+            }
+        }
+        other => panic!("expected fn, got {other:?}"),
+    }
+}
+
+#[test]
+fn volatile_bind_parses_in_both_orders() {
+    for src in [
+        "fn f() { bind volatile mut v @ rax = 1; }",
+        "fn f() { bind mut volatile v @ rax = 1; }",
+    ] {
+        let file = parse_ok(src);
+        match &file.items[0] {
+            Item::Fn(f) => match &f.body.stmts[0] {
+                Stmt::Bind { mutable, volatile, .. } => {
+                    assert!(mutable, "{src}");
+                    assert!(volatile, "{src}");
+                }
+                other => panic!("expected bind, got {other:?}"),
+            },
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn naked_attribute_is_recognized() {
+    let file = parse_ok("#[naked]\nfn f() { return; }");
+    match &file.items[0] {
+        Item::Fn(f) => assert!(f.is_naked()),
+        other => panic!("expected fn, got {other:?}"),
+    }
+}
+
+// §8 const-only structs: `struct Name { field: Ty, ... }`.
+#[test]
+fn struct_decl_parses() {
+    let f = parse_ok(
+        r#"
+struct Point {
+    x: u32,
+    y: u32,
+}
+"#,
+    );
+    match &f.items[0] {
+        Item::Struct(s) => {
+            assert_eq!(s.name, "Point");
+            assert_eq!(s.fields.len(), 2);
+            assert_eq!(s.fields[0].name, "x");
+            assert!(matches!(s.fields[0].ty, Ty::U32));
+            assert_eq!(s.fields[1].name, "y");
+            assert!(!s.name_span.is_dummy());
+        }
+        other => panic!("expected struct, got {other:?}"),
+    }
+}
+
+#[test]
+fn struct_constructor_parses_as_const_call() {
+    let f = parse_ok(
+        r#"
+struct Point { x: u32, y: u32 }
+const P: Point = Point(1, 2);
+bind p @ .rodata: Point = Point(3, 4);
+"#,
+    );
+    match &f.items[1] {
+        Item::Const(c) => match &c.value {
+            ConstExpr::Call { name, args, .. } => {
+                assert_eq!(name, "Point");
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected struct constructor call, got {other:?}"),
+        },
+        other => panic!("expected const, got {other:?}"),
+    }
+    match &f.items[2] {
+        Item::Static(s) => match &s.init {
+            Some(Value::Const { expr: ConstExpr::Call { name, args, .. }, .. }) => {
+                assert_eq!(name, "Point");
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected struct static initializer, got {other:?}"),
+        },
+        other => panic!("expected static, got {other:?}"),
     }
 }

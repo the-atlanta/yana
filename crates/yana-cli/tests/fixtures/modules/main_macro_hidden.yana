@@ -1,0 +1,6 @@
+use macro_def::hidden;
+
+#[entry]
+fn main() -> ! {
+    hidden!(1);
+}

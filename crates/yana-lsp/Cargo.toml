@@ -10,9 +10,12 @@ name = "yana-lsp"
 path = "src/main.rs"
 
 [dependencies]
+yana-knowledge.workspace = true
+yana-symbols.workspace = true
 yana-ast = { workspace = true }
 yana-lexer = { workspace = true }
 yana-parser = { workspace = true }
 yana-codegen = { workspace = true }
 tower-lsp = { workspace = true }
 tokio = { workspace = true }
+serde_json = { workspace = true }

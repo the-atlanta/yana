@@ -8,8 +8,8 @@
 
 use yana_ast::{
     Attr, AttrArg, AssignOp, AltModifier, AtomicOrder, Block, BranchCond, CallArg, CallResults,
-    CmpOp, ConstBinOp, ConstExpr, ConstUnOp, Clobbers, File, Flag, Item, Param, Place, RetSig,
-    Span, Stmt, Ty, Value,
+    CmpOp, ConstBinOp, ConstExpr, ConstUnOp, Clobbers, File, Flag, GroupDecl, Item, Param, Place,
+    RetSig, Span, Stmt, Ty, Value,
 };
 use yana_ast::place::{MemTerm, RawAddr};
 use yana_ast::reg::Reg;
@@ -47,6 +47,13 @@ extern {
         "if"       => Token::KwIf,
         "else"     => Token::KwElse,
         "let"      => Token::KwLet,
+        "group"    => Token::KwGroup,
+        "struct"   => Token::KwStruct,
+        "stack"    => Token::KwStack,
+        "breakpoint" => Token::KwBreakpoint,
+        "trap"     => Token::KwTrap,
+        "assert"   => Token::KwAssert,
+        "debug"    => Token::KwDebug,
         "for"      => Token::KwFor,
         "preserves"=> Token::KwPreserves,
         "requires" => Token::KwRequires,
@@ -127,6 +134,7 @@ extern {
         "num"   => Token::Num(<String>),
         "char"  => Token::Char(<u8>),
         "str"   => Token::Str(<String>),
+        "bytestr" => Token::ByteStr(<String>),
         "lbl"   => Token::LabelRef(<String>),
         "pair"  => Token::PairReg(<(yana_ast::reg::Reg, yana_ast::reg::Reg, u32, u32)>),
     }
@@ -146,6 +154,13 @@ NumSp: i128 = {
 
 StrSp: Vec<u8> = {
     <lo: @L> <s: "str"> <hi: @R> =>? gram::parse_str(&s, Span::new(lo as u32, hi as u32)),
+};
+
+ByteStrSp: (Vec<u8>, Span) = {
+    <lo: @L> <s: "bytestr"> <hi: @R> =>? {
+        let span = Span::new(lo as u32, hi as u32);
+        gram::parse_byte_str(&s, span).map(|bytes| (bytes, span))
+    },
 };
 
 CharVal: i128 = {
@@ -177,6 +192,7 @@ Ty: Ty = {
         v.extend(rest);
         Ty::Tuple(v)
     },
+    <i: IdentSp> => Ty::Struct(i.v),
 };
 
 OptTy: Option<Ty> = {
@@ -227,15 +243,33 @@ RawAddr: RawAddr = {
 
 PlaceUntyped: Place = {
     <i: IdentSp> => gram::ident_place(&i.v, i.span),
+    <g: GroupPlace> => g,
     <p: "pair"> => Place::RegPair { hi: p.0, lo: p.1, ty: None, span: Span::new(p.2, p.3) },
     <a: RawAddr> => { let span = a.span; Place::Mem { addr: a, ty: None, span } },
     // optional size annotation on a memory operand (§3): `@[rbx+rcx*8+16]: u64`
     <a: RawAddr> ":" <t: Ty> => { let span = a.span; Place::Mem { addr: a, ty: Some(t), span } },
 };
 
+// `group(name)` — a named alias for a list of places (§3).
+GroupPlace: Place = {
+    <lo: @L> "group" "(" <i: IdentSp> ")" <hi: @R> =>
+        Place::Group { name: i.v, span: Span::new(lo as u32, hi as u32) },
+};
+
+// `stack` (8 bytes) / `stack(N)` — a frame slot (§3).
+StackPlace: Place = {
+    <lo: @L> "stack" <hi: @R> =>
+        Place::Stack { size: None, ty: None, span: Span::new(lo as u32, hi as u32) },
+    <lo: @L> "stack" "(" <n: NumSp> ")" <hi: @R> =>
+        Place::Stack { size: Some(n as u32), ty: None, span: Span::new(lo as u32, hi as u32) },
+};
+
 PlaceTyped: Place = {
     <i: IdentSp> => gram::ident_place(&i.v, i.span),
     <i: IdentSp> ":" <t: Ty> => gram::ident_place(&i.v, i.span).with_ty(Some(t)),
+    <g: GroupPlace> => g,
+    <s: StackPlace> => s,
+    <s: StackPlace> ":" <t: Ty> => s.with_ty(Some(t)),
     <p: "pair"> => Place::RegPair { hi: p.0, lo: p.1, ty: None, span: Span::new(p.2, p.3) },
     <p: "pair"> ":" <t: Ty> => Place::RegPair { hi: p.0, lo: p.1, ty: Some(t), span: Span::new(p.2, p.3) },
     <a: RawAddr> => { let span = a.span; Place::Mem { addr: a, ty: None, span } },
@@ -256,7 +290,17 @@ AtomVal: Value = {
     <lo: @L> "-" <n: NumSp> <hi: @R> => Value::Imm { value: -n, span: Span::new(lo as u32, hi as u32) },
     <c: CharVal> => Value::Imm { value: c, span: Span::DUMMY },
     <s: StrSp> => Value::Str { bytes: s, span: Span::DUMMY },
+    <b: ByteStrSp> => Value::Bytes { bytes: b.0, span: b.1 },
     "const" "{" <e: ConstExpr> "}" => Value::Const { expr: e, span: Span::DUMMY },
+    <lo: @L> <i: IdentSp> "(" <args: Comma0<ConstExpr>> ")" <hi: @R> =>
+        Value::Const {
+            expr: ConstExpr::Call {
+                name: i.v,
+                args,
+                span: Span::new(lo as u32, hi as u32),
+            },
+            span: Span::new(lo as u32, hi as u32),
+        },
 };
 
 SuffixVal: Value = {
@@ -333,6 +377,7 @@ CUn: ConstExpr = {
 };
 CAtom: ConstExpr = {
     <n: NumSp> => ConstExpr::Int { value: n, span: Span::DUMMY },
+    <b: ByteStrSp> => ConstExpr::Bytes { bytes: b.0, span: b.1 },
     "true"  => ConstExpr::Bool { value: true, span: Span::DUMMY },
     "false" => ConstExpr::Bool { value: false, span: Span::DUMMY },
     <i: IdentSp> => ConstExpr::Name { name: i.v, span: i.span },
@@ -420,10 +465,23 @@ Item: Item = {
     <e: ExternFn>   => gram::item_extern(e),
     <c: ConstDecl>  => c,
     <s: StaticBind> => gram::item_static(s),
+    <g: GroupItem>  => g,
+    <s: StructItem> => s,
     <u: UseItem>    => u,
     // `pub` was removed from the language (SPEC §15, решение 29.10) —
     // fail with a precise diagnostic instead of a generic parse error.
     <lo: @L> "pub" <hi: @R> =>? Err(gram::removed_pub(lo, hi)),
+};
+
+// `struct Name { field: Ty, ... }` (§8) — const-only data layout.
+StructItem: Item = {
+    <lo: @L> "struct" <i: IdentSp> "{" <fields: Comma0<StructField>> "}" <hi: @R> =>
+        gram::item_struct(i, fields, lo, hi),
+};
+
+StructField: gram::StructFieldSp = {
+    <lo: @L> <i: IdentSp> ":" <t: Ty> <hi: @R> =>
+        gram::struct_field(i, t, lo, hi),
 };
 
 // `use path::name;` (§10) — the path segments are identifiers separated by
@@ -435,6 +493,47 @@ UseItem: Item = {
 UsePath: Vec<gram::Sp<String>> = {
     <i: IdentSp> => vec![i],
     <mut p: UsePath> "::" <i: IdentSp> => { p.push(i); p },
+};
+
+// `bind` qualifiers (§3/§12): `mut` and `volatile` in any order.
+BindQuals: (bool, bool) = {
+    "volatile" <m: MutOpt> => (true, m),
+    "mut" <v: VolatileOpt> => (v, true),
+};
+
+MutOpt: bool = {
+    => false,
+    "mut" => true,
+};
+
+VolatileOpt: bool = {
+    => false,
+    "volatile" => true,
+};
+
+// `group (name) | places |;` (§3) — a named alias for a list of places.
+// Declaring one emits no code; it is expanded where used.
+GroupItem: Item = {
+    <g: GroupDecl> => Item::Group(g),
+};
+
+GroupDecl: GroupDecl = {
+    <lo: @L> "group" "(" <i: IdentSp> ")" "|" <ps: Comma0<GroupMember>> "|" ";" <hi: @R> =>
+        GroupDecl {
+            name: i.v,
+            name_span: i.span,
+            places: ps,
+            span: Span::new(lo as u32, hi as u32),
+        },
+};
+
+// A member of a group: a register, or a frame slot `stack` / `stack(N)`.
+GroupMember: Place = {
+    <i: IdentSp> => gram::ident_place(&i.v, i.span),
+    <lo: @L> "stack" <hi: @R> =>
+        Place::Stack { size: None, ty: None, span: Span::new(lo as u32, hi as u32) },
+    <lo: @L> "stack" "(" <n: NumSp> ")" <hi: @R> =>
+        Place::Stack { size: Some(n as u32), ty: None, span: Span::new(lo as u32, hi as u32) },
 };
 
 // `const fn name(...) -> T { return expr; }` and `const NAME: T = expr;` share
@@ -478,6 +577,13 @@ ClobbersOpt: Option<Clobbers> = {
         Some(Clobbers { regs, span: Span::new(lo as u32, hi as u32) }),
 };
 
+// `preserves: rbx, rbp, ...` (§5.4) — callee-saved promises.
+PreservesOpt: Option<Clobbers> = {
+    => None,
+    <lo: @L> "preserves" ":" <regs: Comma0<RegIdent>> <hi: @R> =>
+        Some(Clobbers { regs, span: Span::new(lo as u32, hi as u32) }),
+};
+
 // §14.4 minimal contracts (SPEC §15 ✅ 30.10): `requires <expr>;` /
 // `ensures <expr>;` clauses after the optional clobbers block, before the
 // body. Expressions reuse the ConstExpr precedence chain.
@@ -491,16 +597,18 @@ ContractClause: (gram::ContractKind, gram::Sp<ConstExpr>) = {
         gram::contract_clause(gram::ContractKind::Requires, e, lo, hi),
     <lo: @L> "ensures" <e: ConstExpr> ";" <hi: @R> =>
         gram::contract_clause(gram::ContractKind::Ensures, e, lo, hi),
+    <lo: @L> "invariant" <e: ConstExpr> ";" <hi: @R> =>
+        gram::contract_clause(gram::ContractKind::Invariant, e, lo, hi),
 };
 
 FnItem: yana_ast::FnItem = {
-    <lo: @L> <attrs: Attrs> "fn" <i: IdentSp> "(" <params: Comma0<Param>> ")" <ret: RetSig> <cl: ClobbersOpt> <ct: ContractsOpt> <body: Block> <hi: @R> =>
-        gram::fn_item(attrs, i, params, ret, cl, ct, body, lo, hi),
+    <lo: @L> <attrs: Attrs> "fn" <i: IdentSp> "(" <params: Comma0<Param>> ")" <ret: RetSig> <cl: ClobbersOpt> <pr: PreservesOpt> <ct: ContractsOpt> <body: Block> <hi: @R> =>
+        gram::fn_item(attrs, i, params, ret, cl, pr, ct, body, lo, hi),
 };
 
 ExternFn: yana_ast::ExternFnItem = {
-    <lo: @L> <attrs: Attrs> "extern" <abi: AbiStr?> "fn" <i: IdentSp> "(" <params: Comma0<Param>> ")" <ret: RetSig> <cl: ClobbersOpt> <ct: ContractsOpt> ";" <hi: @R> =>
-        gram::extern_fn_item(attrs, abi, i, params, ret, cl, ct, lo, hi),
+    <lo: @L> <attrs: Attrs> "extern" <abi: AbiStr?> "fn" <i: IdentSp> "(" <params: Comma0<Param>> ")" <ret: RetSig> <cl: ClobbersOpt> <pr: PreservesOpt> <ct: ContractsOpt> ";" <hi: @R> =>
+        gram::extern_fn_item(attrs, abi, i, params, ret, cl, pr, ct, lo, hi),
 };
 
 AbiStr: String = {
@@ -526,6 +634,7 @@ StaticInit: Option<Value> = {
     "=" <v: Value> => Some(v),
 };
 
+
 // ---------------------------------------------------------------------------
 // blocks and statements (§3–§6)
 // ---------------------------------------------------------------------------
@@ -536,9 +645,21 @@ Block: Block = {
 
 Stmt: Stmt = {
     // bind [mut] name @ place [= init];
-    <lo: @L> "bind" <m: "mut"?> <i: IdentSp> "@" <p: PlaceTyped> <init: BindInit> ";" <hi: @R> =>
+    <lo: @L> "bind" <i: IdentSp> "@" <p: PlaceTyped> <init: BindInit> ";" <hi: @R> =>
         Stmt::Bind {
-            mutable: m.is_some(),
+            mutable: false,
+            volatile: false,
+            name: Some(i.v),
+            name_span: i.span,
+            place: p,
+            init,
+            pattern: None,
+            span: Span::new(lo as u32, hi as u32),
+        },
+    <lo: @L> "bind" <q: BindQuals> <i: IdentSp> "@" <p: PlaceTyped> <init: BindInit> ";" <hi: @R> =>
+        Stmt::Bind {
+            mutable: q.1,
+            volatile: q.0,
             name: Some(i.v),
             name_span: i.span,
             place: p,
@@ -552,6 +673,7 @@ Stmt: Stmt = {
         pattern.extend(rest);
         Stmt::Bind {
             mutable: false,
+            volatile: false,
             name: None,
             name_span: Span::new(lo as u32, hi as u32),
             place: Place::Discard { span: Span::DUMMY },
@@ -560,6 +682,17 @@ Stmt: Stmt = {
             span: Span::new(lo as u32, hi as u32),
         }
     },
+    // `group (name) | places |;` (§3) — block-scoped alias
+    <g: GroupDecl> => Stmt::Group(g),
+    // debug statements (§4.6)
+    <lo: @L> "breakpoint" ";" <hi: @R> => Stmt::Breakpoint { span: Span::new(lo as u32, hi as u32) },
+    <lo: @L> "trap" ";" <hi: @R> => Stmt::Trap { span: Span::new(lo as u32, hi as u32) },
+    <lo: @L> "assert" "(" <c: BranchCondInner> ")" ";" <hi: @R> =>
+        Stmt::Assert { cond: c, span: Span::new(lo as u32, hi as u32) },
+    <lo: @L> "debug" <b: Block> <hi: @R> => Stmt::Debug(Block {
+        stmts: b.stmts,
+        span: Span::new(lo as u32, hi as u32),
+    }),
     // alt [modifier] dst <op>= src;
     // §12 modifiers: `alt atomic(order)` / `alt volatile`; plain form keeps
     // its own rule so LALR(1) can split on the token right after `alt`.

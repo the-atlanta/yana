@@ -13,6 +13,7 @@ name = "yana"
 path = "src/main.rs"
 
 [dependencies]
+yana-knowledge.workspace = true
 yana-ast = { workspace = true }
 yana-lexer = { workspace = true }
 yana-parser = { workspace = true }

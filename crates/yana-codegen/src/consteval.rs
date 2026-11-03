@@ -84,6 +84,14 @@ impl ConstError {
 
 pub type ConstResult<T> = Result<T, ConstError>;
 
+/// Convenience for editor/CLI frontends: evaluate a constant expression with
+/// no surrounding const environment. Unknown names and evaluation errors
+/// collapse to `None` — this is a best-effort hover value, not a diagnostic.
+pub fn try_eval(expr: &ConstExpr) -> Option<i128> {
+    let mut env = ConstEnv::new();
+    eval(&mut env, expr, &HashMap::new()).ok().and_then(|v| v.as_int())
+}
+
 /// Evaluate a const expression.
 pub fn eval(env: &mut ConstEnv, expr: &ConstExpr, locals: &HashMap<String, Value>) -> ConstResult<Value> {
     env.steps_used += 1;
@@ -97,6 +105,16 @@ pub fn eval(env: &mut ConstEnv, expr: &ConstExpr, locals: &HashMap<String, Value
     match expr {
         ConstExpr::Int { value, .. } => Ok(Value::Int(*value)),
         ConstExpr::Bool { value, .. } => Ok(Value::Bool(*value)),
+        ConstExpr::Bytes { bytes, .. } => {
+            if bytes.len() <= 8 {
+                // ≤8 bytes pack into a little-endian integer (zero-extended).
+                let mut buf = [0u8; 16];
+                buf[..bytes.len()].copy_from_slice(bytes);
+                Ok(Value::Int(i128::from_le_bytes(buf)))
+            } else {
+                Ok(Value::Array(bytes.iter().map(|b| Value::Int(*b as i128)).collect()))
+            }
+        }
         ConstExpr::Name { name, span } => {
             if let Some(v) = locals.get(name) {
                 return Ok(v.clone());

@@ -12,6 +12,8 @@
 
 pub mod encode;
 pub mod elf;
+pub mod macho;
 
 pub use encode::{assemble_text, disassemble, section_bytes, AsmError, EncodedText, Layout, PatchSite, RelocKind};
 pub use elf::{link_exe, write_object};
+pub use macho::write_object as write_object_macho;

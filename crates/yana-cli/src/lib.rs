@@ -15,6 +15,7 @@
 //! system `ld` (entry = the root module's `#[entry]` symbol). Files without
 //! `use` keep the single-file pipeline (link_exe static path) unchanged.
 
+pub mod fmt;
 pub mod loader;
 pub mod report;
 
@@ -53,12 +54,22 @@ enum Cmd {
         /// verify errors fail the build
         #[arg(long)]
         verify: bool,
+        /// Release build: `debug { ... }` blocks are skipped (§4.6)
+        #[arg(long)]
+        release: bool,
+        /// Target triple: `x86_64-linux` (default), `x86_64-macos`
+        /// (object-only for now), `aarch64-linux`, `xtensa-esp32s3`
+        #[arg(long, default_value = "x86_64-linux")]
+        target: String,
     },
     /// Compile and run (iced backend, static executable)
     Run {
         file: PathBuf,
         #[arg(long)]
         strict: bool,
+        /// Release build: `debug { ... }` blocks are skipped (§4.6)
+        #[arg(long)]
+        release: bool,
     },
     /// Print the resolved IR, one instruction per line (§14 pass 2)
     Expand {
@@ -82,6 +93,22 @@ enum Cmd {
     /// §14 pass 4: verify (interval analysis + `requires`/`ensures` via z3);
     /// exit code = number of verify errors
     Verify { file: PathBuf },
+    /// Show built-in YANA documentation (keywords, registers, types,
+    /// sections, flags, attributes, syscalls)
+    Doc {
+        /// Name to look up; omit to list keywords
+        name: Option<String>,
+    },
+    /// Format a source file (indentation, trailing whitespace, blank lines)
+    Fmt {
+        file: PathBuf,
+        /// Rewrite the file in place instead of printing to stdout
+        #[arg(short, long)]
+        write: bool,
+        /// Check only: exit 1 if the file is not formatted
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(ValueEnum, Clone, Copy, PartialEq, Eq)]
@@ -99,12 +126,16 @@ where
 {
     let cli = Cli::parse_from(args);
     match cli.cmd {
-        Cmd::Build { file, out, backend, object, strict, verify } => cmd_build(&file, out, backend, object, strict, verify),
-        Cmd::Run { file, strict } => cmd_run(&file, strict),
+        Cmd::Build { file, out, backend, object, strict, verify, release, target } => {
+            cmd_build(&file, out, backend, object, strict, verify, release, &target)
+        }
+        Cmd::Run { file, strict, release } => cmd_run(&file, strict, release),
         Cmd::Expand { file, macros } => cmd_expand(&file, macros),
         Cmd::Nasm { file, out, assemble } => cmd_nasm(&file, out, assemble),
         Cmd::Oracle { file } => cmd_oracle(&file),
         Cmd::Verify { file } => cmd_verify(&file),
+        Cmd::Doc { name } => cmd_doc(name.as_deref()),
+        Cmd::Fmt { file, write, check } => cmd_fmt(&file, write, check),
     }
 }
 
@@ -145,7 +176,17 @@ fn load(path: &Path) -> Option<Loaded> {
 
 /// Parse + resolve, rendering diagnostics. Returns None on any fatal error.
 /// `verify` additionally runs §14 pass 4 after pass 3 (`build --verify`).
-fn resolve_ex(loaded: &Loaded, strict: bool, verify: bool) -> Option<Module> {
+fn resolve_ex(loaded: &Loaded, strict: bool, verify: bool, release: bool) -> Option<Module> {
+    resolve_ex_target(loaded, strict, verify, release, &TargetInfo::linux_x86_64())
+}
+
+fn resolve_ex_target(
+    loaded: &Loaded,
+    strict: bool,
+    verify: bool,
+    release: bool,
+    target: &TargetInfo,
+) -> Option<Module> {
     let parsed = yana_parser::parse(&loaded.source);
     let mut diags = parsed.diagnostics.clone();
     let file = match parsed.file {
@@ -155,9 +196,8 @@ fn resolve_ex(loaded: &Loaded, strict: bool, verify: bool) -> Option<Module> {
             return None;
         }
     };
-    let target = TargetInfo::linux_x86_64();
-    let opts = ResolveOptions { strict, ..Default::default() };
-    let mut out = resolve_module(&file, &target, &opts);
+    let opts = ResolveOptions { strict, debug: !release, ..Default::default() };
+    let mut out = resolve_module(&file, target, &opts);
     let had_errors = out.has_errors();
     diags.extend(out.diagnostics.clone());
     if !had_errors {
@@ -180,7 +220,7 @@ fn resolve_ex(loaded: &Loaded, strict: bool, verify: bool) -> Option<Module> {
 
 /// Parse + resolve, rendering diagnostics. Returns None on any fatal error.
 fn resolve(loaded: &Loaded, strict: bool) -> Option<Module> {
-    resolve_ex(loaded, strict, false)
+    resolve_ex(loaded, strict, false, false)
 }
 
 /// Resolve WITHOUT pass 3 (`yana verify`, NOTES-verify D3: pass 4 stays
@@ -317,7 +357,42 @@ fn build_multi(path: &Path, strict: bool, exe: &Path, verify: bool) -> Result<Op
 // subcommands
 // ---------------------------------------------------------------------------
 
-fn cmd_build(path: &Path, out: Option<PathBuf>, backend: BackendArg, object: bool, strict: bool, verify: bool) -> i32 {
+fn parse_target(name: &str) -> Result<TargetInfo, String> {
+    use yana_codegen::{Arch, Os, TargetInfo};
+    match name {
+        "x86_64-linux" | "x86_64-unknown-linux-gnu" => Ok(TargetInfo::linux_x86_64()),
+        "x86_64-macos" | "x86_64-apple-darwin" => Ok(TargetInfo { arch: Arch::X86_64, os: Os::Macos }),
+        "aarch64-linux" | "aarch64-unknown-linux-gnu" => Ok(TargetInfo::aarch64_linux()),
+        "xtensa-esp32s3" | "xtensa-esp32s3-elf" => Ok(TargetInfo::xtensa_esp32s3()),
+        other => Err(format!(
+            "unknown target `{other}` (expected x86_64-linux, x86_64-macos, aarch64-linux or xtensa-esp32s3)"
+        )),
+    }
+}
+
+fn cmd_build(
+    path: &Path,
+    out: Option<PathBuf>,
+    backend: BackendArg,
+    object: bool,
+    strict: bool,
+    verify: bool,
+    release: bool,
+    target_name: &str,
+) -> i32 {
+    let target = match parse_target(target_name) {
+        Ok(t) => t,
+        Err(e) => return fail(&e),
+    };
+    let is_linux_x86 = target.arch == yana_codegen::Arch::X86_64 && target.os == yana_codegen::Os::Linux;
+    let is_macos_x86 = target.arch == yana_codegen::Arch::X86_64 && target.os == yana_codegen::Os::Macos;
+    if !is_linux_x86 {
+        if !(is_macos_x86 && object && backend == BackendArg::Iced) {
+            return fail(&format!(
+                "target `{target_name}` is not supported yet (F7–F9): only x86_64-linux executables and x86_64-macos `--object` are available"
+            ));
+        }
+    }
     // §10: auto-discover `use` dependencies; single-file behavior is
     // unchanged when the file has no `use` items.
     let has_uses = std::fs::read_to_string(path)
@@ -328,6 +403,12 @@ fn cmd_build(path: &Path, out: Option<PathBuf>, backend: BackendArg, object: boo
                 .unwrap_or(false)
         })
         .unwrap_or(false);
+
+    if has_uses && !is_linux_x86 {
+        return fail(&format!(
+            "multi-module builds are only supported for x86_64-linux (target `{target_name}` requested)"
+        ));
+    }
 
     if has_uses && backend == BackendArg::Iced {
         let out = out.unwrap_or_else(|| default_out(path, backend, object));
@@ -356,7 +437,7 @@ fn cmd_build(path: &Path, out: Option<PathBuf>, backend: BackendArg, object: boo
     }
 
     let Some(loaded) = load(path) else { return 2 };
-    let Some(module) = resolve_ex(&loaded, strict, verify) else { return 1 };
+    let Some(module) = resolve_ex_target(&loaded, strict, verify, release, &target) else { return 1 };
     let out = out.unwrap_or_else(|| default_out(path, backend, object));
 
     match backend {
@@ -366,7 +447,12 @@ fn cmd_build(path: &Path, out: Option<PathBuf>, backend: BackendArg, object: boo
                     Ok(e) => e,
                     Err(e) => return fail(&e.to_string()),
                 };
-                match yana_back_iced::write_object(&module, &enc) {
+                let written = if is_macos_x86 {
+                    yana_back_iced::write_object_macho(&module, &enc)
+                } else {
+                    yana_back_iced::write_object(&module, &enc)
+                };
+                match written {
                     Ok(b) => b,
                     Err(e) => return fail(&e.to_string()),
                 }
@@ -413,7 +499,7 @@ fn cmd_build(path: &Path, out: Option<PathBuf>, backend: BackendArg, object: boo
     }
 }
 
-fn cmd_run(path: &Path, strict: bool) -> i32 {
+fn cmd_run(path: &Path, strict: bool, release: bool) -> i32 {
     // §10: multi-module run goes through the ld path
     let has_uses = std::fs::read_to_string(path)
         .map(|src| {
@@ -440,7 +526,7 @@ fn cmd_run(path: &Path, strict: bool) -> i32 {
         }
     } else {
         let Some(loaded) = load(path) else { return 2 };
-        let Some(module) = resolve(&loaded, strict) else { return 1 };
+        let Some(module) = resolve_ex(&loaded, strict, false, release) else { return 1 };
         match yana_back_iced::link_exe(&module) {
             Ok(b) => b,
             Err(e) => return fail(&e.to_string()),
@@ -761,5 +847,93 @@ fn set_executable(p: &Path) -> Result<(), String> {
 
 fn fail(msg: &str) -> i32 {
     eprintln!("yana: {msg}");
+    1
+}
+
+/// `yana doc [name]` (§16 tooling): print the same knowledge table the LSP
+/// uses for hover/completion.
+/// `yana fmt` — conservative source formatter (see [`fmt`]).
+fn cmd_fmt(path: &Path, write: bool, check: bool) -> i32 {
+    let source = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("yana: cannot read {}: {e}", path.display());
+            return 1;
+        }
+    };
+    let formatted = fmt::format_source(&source);
+    if check {
+        if formatted == source {
+            return 0;
+        }
+        eprintln!("yana: {} is not formatted", path.display());
+        return 1;
+    }
+    if write {
+        if formatted == source {
+            return 0;
+        }
+        if let Err(e) = std::fs::write(path, formatted) {
+            eprintln!("yana: cannot write {}: {e}", path.display());
+            return 1;
+        }
+        return 0;
+    }
+    print!("{formatted}");
+    0
+}
+
+fn cmd_doc(name: Option<&str>) -> i32 {
+    use yana_knowledge as k;
+    let Some(name) = name else {
+        println!("YANA keywords (§1–§14):\n");
+        for item in k::keywords() {
+            println!("  {:<14} {}", item.label, item.detail);
+        }
+        println!("\nLook up a register, type, section, flag, attribute, syscall or keyword:");
+        println!("  yana doc rax");
+        println!("  yana doc write");
+        println!("  yana doc syscall:1");
+        return 0;
+    };
+
+    // syscall:<nr> or a bare syscall name
+    let syscall = name
+        .strip_prefix("syscall:")
+        .and_then(|n| n.parse::<i64>().ok())
+        .and_then(k::syscalls::by_number)
+        .or_else(|| k::syscalls::by_name(name));
+    if let Some(sc) = syscall {
+        println!("syscall {} — {}  ({})", sc.nr, sc.name, sc.man);
+        println!("{}", sc.signature);
+        println!("\n{}", sc.summary);
+        if !sc.args.is_empty() {
+            println!("\narguments:");
+            for a in sc.args {
+                println!("  {:<4} {:<10} {:<8} {}", a.reg, a.name, a.ty, a.doc);
+            }
+        }
+        println!("\nreturns: {}", sc.returns);
+        return 0;
+    }
+
+    if let Some(docs) = k::keyword_hover(name) {
+        println!("{docs}");
+        return 0;
+    }
+    if let Some(docs) = k::register_hover(name) {
+        println!("{docs}");
+        return 0;
+    }
+    for item in k::types().into_iter().chain(k::sections()).chain(k::flags()).chain(k::attributes()) {
+        if item.label == name {
+            println!("{} — {}", item.label, item.detail);
+            if !item.docs.is_empty() {
+                println!("\n{}", item.docs);
+            }
+            return 0;
+        }
+    }
+    eprintln!("yana: no documentation for `{name}`");
     1
 }

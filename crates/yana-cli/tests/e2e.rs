@@ -861,6 +861,7 @@ ensures rax >= 0;
     let c = &module.symbols[sym].contracts;
     assert_eq!(c.requires.len(), 1);
     assert_eq!(c.ensures.len(), 1);
+    assert!(c.invariants.is_empty());
     assert_eq!(c.params, vec![("n".to_string(), yana_ast::Reg::parse("rdi").unwrap())]);
     assert_eq!(c.results, vec![("rax".to_string(), yana_ast::Reg::parse("rax").unwrap())]);
 }
@@ -936,4 +937,295 @@ requires [n, n] != 0;
         "{:?}",
         diags.iter().map(|d| (&d.kind, &d.message)).collect::<Vec<_>>()
     );
+}
+
+// ---------------------------------------------------------------------------
+// §5.3 stack arguments, §4.6 debug/assert, §5.6 #[naked]
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stack_args_push_in_reverse_and_caller_cleans_up() {
+    let src = r#"
+fn add3(a @ rdi: u64, b @ stack: u64, c @ stack: u64) -> rax: u64 {
+    alt rax = a;
+    alt rax += b;
+    alt rax += c;
+    return;
+}
+#[entry]
+fn main() -> ! {
+    bind r = call add3 { a: 1, b: 2, c: 3 };
+    syscall;
+}
+"#;
+    let text = assemble(src);
+    let dis = yana_back_iced::disassemble(&text, 0);
+    let joined = dis.join("\n");
+    // last stack arg first
+    let push3 = joined.find("push 3").expect("push 3");
+    let push2 = joined.find("push 2").expect("push 2");
+    assert!(push3 < push2, "stack args must be pushed right-to-left:\n{joined}");
+    assert!(joined.contains("call"), "{joined}");
+    assert_eq!(joined.matches("lea rsp,[rsp+8h]").count(), 2, "{joined}");
+}
+
+#[test]
+fn assert_lowers_to_cmp_jcc_ud2() {
+    let src = r#"
+#[entry]
+fn main() -> ! {
+    bind mut x @ rdi = 5;
+    alt x = 6;
+    assert (x == 5);
+    syscall;
+}
+"#;
+    let text = assemble(src);
+    let joined = yana_back_iced::disassemble(&text, 0).join("\n");
+    assert!(joined.contains("cmp"), "{joined}");
+    assert!(joined.contains("jne"), "{joined}");
+    assert!(joined.contains("ud2"), "{joined}");
+}
+
+#[test]
+fn debug_block_is_skipped_in_release() {
+    let src = r#"
+#[entry]
+fn main() -> ! {
+    debug { alt rdi = 7; }
+    syscall;
+}
+"#;
+    let parsed = yana_parser::parse(src);
+    let target = TargetInfo::linux_x86_64();
+
+    let mut debug_opts = ResolveOptions::default();
+    debug_opts.debug = true;
+    let dbg = resolve_module(parsed.file.as_ref().unwrap(), &target, &debug_opts).module;
+    let dbg_text = yana_back_iced::assemble_text(&dbg, Some(yana_back_iced::Layout::default_x86_64()))
+        .expect("assemble debug")
+        .text;
+    assert!(yana_back_iced::disassemble(&dbg_text, 0).join("\n").contains("mov rdi,7"));
+
+    let mut rel_opts = ResolveOptions::default();
+    rel_opts.debug = false;
+    let rel = resolve_module(parsed.file.as_ref().unwrap(), &target, &rel_opts).module;
+    let rel_text = yana_back_iced::assemble_text(&rel, Some(yana_back_iced::Layout::default_x86_64()))
+        .expect("assemble release")
+        .text;
+    assert!(!yana_back_iced::disassemble(&rel_text, 0).join("\n").contains("mov rdi,7"));
+}
+
+#[test]
+fn naked_function_has_no_prologue_or_epilogue() {
+    let src = r#"
+#[naked]
+fn hand() -> rax: u64 {
+    alt rax = 42;
+    return;
+}
+#[entry]
+fn main() -> ! {
+    syscall;
+}
+"#;
+    let text = assemble(src);
+    let joined = yana_back_iced::disassemble(&text, 0).join("\n");
+    assert!(!joined.contains("push rbp"), "{joined}");
+    assert!(!joined.contains("mov rbp,rsp"), "{joined}");
+    assert!(joined.contains("mov rax,2Ah") || joined.contains("mov rax,42"), "{joined}");
+}
+
+
+#[test]
+fn invariant_resolves_into_symbol() {
+    let src = r#"
+fn f(n @ rdi: u64) -> rax: u64
+invariant n < 100;
+invariant rax <= 100;
+{
+    return;
+}
+"#;
+    let (module, diags) = resolve(src);
+    assert!(
+        !diags.iter().any(|d| matches!(d.level, yana_ast::DiagLevel::Error)),
+        "{:?}",
+        diags.iter().map(|d| (&d.kind, &d.message)).collect::<Vec<_>>()
+    );
+    let sym = module.find("f").expect("symbol f");
+    assert_eq!(module.symbols[sym].contracts.invariants.len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// §8 const-only structs
+// ---------------------------------------------------------------------------
+
+#[test]
+fn struct_const_and_static_resolve() {
+    let src = r#"
+struct Point { x: u32, y: u32 }
+const P: Point = Point(1, 2);
+bind p @ .rodata: Point = P;
+bind q @ .data: Point = Point(3, 4);
+#[entry]
+fn main() -> ! { alt rax = 60; alt rdi = 0; syscall; }
+"#;
+    let (module, diags) = resolve(src);
+    assert!(
+        !diags.iter().any(|d| matches!(d.level, yana_ast::DiagLevel::Error)),
+        "{:?}",
+        diags.iter().map(|d| (&d.kind, &d.message)).collect::<Vec<_>>()
+    );
+    assert!(module.find("P").is_some(), "const symbol");
+    let rodata = module.sections.iter().find(|s| s.kind == yana_ast::place::SectionKind::RoData).unwrap();
+    let bytes: Vec<u8> = rodata
+        .items
+        .iter()
+        .flat_map(|i| match i {
+            yana_codegen::DataItem::Bytes { bytes, .. } => bytes.clone(),
+            _ => vec![],
+        })
+        .collect();
+    assert!(bytes.windows(8).any(|w| w == [1, 0, 0, 0, 2, 0, 0, 0]), "{bytes:?}");
+}
+
+#[test]
+fn struct_layout_pads_and_aligns() {
+    let src = r#"
+struct Inner { a: u8, b: u32 }
+struct Outer { x: u8, inner: Inner, y: u16 }
+const O: Outer = Outer(0x11, Inner(0x22, 0x33333333), 0x4444);
+bind o @ .rodata: Outer = O;
+#[entry]
+fn main() -> ! { alt rax = 60; alt rdi = 0; syscall; }
+"#;
+    let (module, diags) = resolve(src);
+    assert!(
+        !diags.iter().any(|d| matches!(d.level, yana_ast::DiagLevel::Error)),
+        "{:?}",
+        diags.iter().map(|d| (&d.kind, &d.message)).collect::<Vec<_>>()
+    );
+    let rodata = module.sections.iter().find(|s| s.kind == yana_ast::place::SectionKind::RoData).unwrap();
+    let bytes: Vec<u8> = rodata
+        .items
+        .iter()
+        .flat_map(|i| match i {
+            yana_codegen::DataItem::Bytes { bytes, .. } => bytes.clone(),
+            _ => vec![],
+        })
+        .collect();
+    let expected = [0x11, 0, 0, 0, 0x22, 0, 0, 0, 0x33, 0x33, 0x33, 0x33, 0x44, 0x44, 0, 0];
+    assert!(bytes.windows(expected.len()).any(|w| w == expected), "{bytes:?}");
+}
+
+#[test]
+fn struct_init_arity_is_error() {
+    let src = r#"
+struct Point { x: u32, y: u32 }
+const P: Point = Point(1, 2, 3);
+#[entry]
+fn main() -> ! { alt rax = 60; alt rdi = 0; syscall; }
+"#;
+    let (_module, diags) = resolve(src);
+    assert!(diags.iter().any(|d| d.kind == "struct-init-arity"), "{:?}", diags.iter().map(|d| &d.kind).collect::<Vec<_>>());
+}
+
+#[test]
+fn struct_cycle_is_error() {
+    let src = r#"
+struct A { b: B }
+struct B { a: A }
+#[entry]
+fn main() -> ! { alt rax = 60; alt rdi = 0; syscall; }
+"#;
+    let (_module, diags) = resolve(src);
+    assert!(diags.iter().any(|d| d.kind == "struct-cycle"), "{:?}", diags.iter().map(|d| &d.kind).collect::<Vec<_>>());
+}
+
+// ---------------------------------------------------------------------------
+// F8: Mach-O object output (x86-64 macOS)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn macos_target_emits_macho_object() {
+    let src = r#"
+extern "C" fn ext();
+bind msg @ .rodata: [u8; 4] = b"abcd";
+#[entry]
+fn main() -> ! { call ext; alt rax = 60; alt rdi = 0; syscall; }
+"#;
+    let dir = std::env::temp_dir().join(format!("yana-macho-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("m.yana");
+    let output = dir.join("m.o");
+    std::fs::write(&input, src).unwrap();
+    let code = yana_cli::run([
+        "yana",
+        "build",
+        input.to_str().unwrap(),
+        "--target",
+        "x86_64-macos",
+        "--object",
+        "-o",
+        output.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "macho build failed");
+    let bytes = std::fs::read(&output).unwrap();
+    assert_eq!(&bytes[0..4], &0xfeed_facfu32.to_le_bytes(), "MH_MAGIC_64");
+    assert_eq!(
+        u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+        1,
+        "MH_OBJECT"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn unsupported_target_is_a_clean_error() {
+    let src = "#[entry]\nfn main() -> ! { alt rax = 60; alt rdi = 0; syscall; }\n";
+    let dir = std::env::temp_dir().join(format!("yana-target-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("m.yana");
+    std::fs::write(&input, src).unwrap();
+    let code = yana_cli::run([
+        "yana",
+        "build",
+        input.to_str().unwrap(),
+        "--target",
+        "aarch64-linux",
+    ]);
+    assert_eq!(code, 1, "unsupported target must fail");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// F16: `yana fmt`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fmt_write_normalizes_indentation_and_check_detects_it() {
+    let dir = std::env::temp_dir().join(format!("yana-fmt-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("f.yana");
+    std::fs::write(&path, "fn f() {\nalt rax = 1;\n}\n").unwrap();
+
+    // --check fails before formatting
+    assert_eq!(
+        yana_cli::run(["yana", "fmt", path.to_str().unwrap(), "--check"]),
+        1
+    );
+    // --write fixes it
+    assert_eq!(
+        yana_cli::run(["yana", "fmt", path.to_str().unwrap(), "--write"]),
+        0
+    );
+    let formatted = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(formatted, "fn f() {\n    alt rax = 1;\n}\n");
+    // now --check passes
+    assert_eq!(
+        yana_cli::run(["yana", "fmt", path.to_str().unwrap(), "--check"]),
+        0
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -1,0 +1,11 @@
+[package]
+name = "yana-symbols"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+yana-ast.workspace = true
+yana-knowledge.workspace = true
+url = "2"

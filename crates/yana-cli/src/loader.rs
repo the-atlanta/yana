@@ -144,13 +144,18 @@ impl Loader {
             }
         };
 
-        let parsed = yana_parser::parse(&source);
-        for d in &parsed.diagnostics {
-            self.push_diag(path, d.clone());
-        }
-        let ast = match parsed.file {
-            Some(f) => f,
-            None => return None, // parse errors already reported
+        // Parse once to discover `use` items. Diagnostics are deferred until
+        // the final parse: a macro imported from a dependency is unknown to
+        // this first pass and would otherwise be reported spuriously (§10).
+        let mut parsed = yana_parser::parse(&source);
+        let first_ast = match &parsed.file {
+            Some(f) => f.clone(),
+            None => {
+                for d in &parsed.diagnostics {
+                    self.push_diag(path, d.clone());
+                }
+                return None;
+            }
         };
 
         // cycle detection: mark this module as in-progress
@@ -158,8 +163,9 @@ impl Loader {
 
         // collect + load dependencies, extracting imported declarations
         let mut imports: Vec<ImportedDecl> = Vec::new();
+        let mut macro_prelude: Vec<yana_parser::MacroExport> = Vec::new();
         let mut import_names: Vec<(String, PathBuf)> = Vec::new();
-        for uref in cgmod::use_refs(&ast) {
+        for uref in cgmod::use_refs(&first_ast) {
             let (file_seg, item) = match cgmod::split_use_path(&uref.segments) {
                 Ok(x) => x,
                 Err(span) => {
@@ -238,15 +244,35 @@ impl Loader {
             match cgmod::extract_decl(&dep.ast, &dep.module, &item) {
                 Ok(decl) => imports.push(decl),
                 Err(cgmod::ExtractError::Unresolved) => {
-                    self.push_diag(
-                        path,
-                        Diagnostic::error(
-                            DiagCode::Semantic,
-                            "unresolved-import",
-                            format!("module `{}` has no item named `{item}`", display(&dep.path)),
-                            uref.span,
-                        ),
-                    );
+                    // A macro is not an AST item — check the module's
+                    // token-level `#[global]` macro exports (§10).
+                    if let Some(exp) = yana_parser::macros::collect_exports(&dep.source)
+                        .into_iter()
+                        .find(|e| e.name() == item)
+                    {
+                        macro_prelude.push(exp);
+                    } else if yana_parser::macros::defines_macro(&dep.source, &item) {
+                        self.push_diag(
+                            path,
+                            Diagnostic::error(
+                                DiagCode::Semantic,
+                                "unresolved-import",
+                                format!("`{item}` in module `{}` is not exported", display(&dep.path)),
+                                uref.span,
+                            )
+                            .with_help("not exported: add #[global]"),
+                        );
+                    } else {
+                        self.push_diag(
+                            path,
+                            Diagnostic::error(
+                                DiagCode::Semantic,
+                                "unresolved-import",
+                                format!("module `{}` has no item named `{item}`", display(&dep.path)),
+                                uref.span,
+                            ),
+                        );
+                    }
                 }
                 Err(cgmod::ExtractError::NotExported) => {
                     self.push_diag(
@@ -265,8 +291,18 @@ impl Loader {
 
         self.chain.pop();
 
-        // resolve this module with its imports (§10: imports of fn/extern fn
-        // signatures, const values, statics; macro imports are out of scope)
+        // Final parse with imported macros in scope (pass 0.5, §9/§10).
+        parsed = yana_parser::parse_with_prelude(&source, &macro_prelude);
+        for d in &parsed.diagnostics {
+            self.push_diag(path, d.clone());
+        }
+        let ast = match parsed.file {
+            Some(f) => f,
+            None => return None,
+        };
+
+        // resolve this module with its imports (§10: fn/extern fn signatures,
+        // const values, statics, and macros expanded above).
         let target = TargetInfo::linux_x86_64();
         let opts = ResolveOptions { strict, imports, ..Default::default() };
         let mut out = resolve_module(&ast, &target, &opts);

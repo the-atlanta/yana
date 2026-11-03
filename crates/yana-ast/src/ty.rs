@@ -26,6 +26,8 @@ pub enum Ty {
     Slice(Box<Ty>),
     /// Tuple `(A, B, ...)`.
     Tuple(Vec<Ty>),
+    /// Named const-only struct (§8). Layout is resolved by codegen.
+    Struct(String),
     /// The 128-bit register pair `rdx:rax` (§4.5). Only valid for that pair.
     U128,
     I128,
@@ -65,7 +67,7 @@ impl Ty {
             Ty::Ptr(_) => Some(usize_bits),
             Ty::Array(inner, n) => inner.size_bits(usize_bits).map(|b| b * *n as u32),
             Ty::Slice(_) => None,
-            Ty::Tuple(_) => None,
+            Ty::Tuple(_) | Ty::Struct(_) => None,
             Ty::Never => None,
         }
     }

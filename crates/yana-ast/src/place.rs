@@ -86,6 +86,12 @@ pub enum Place {
     Named { name: String, ty: Option<Ty>, span: Span },
     /// A data-section binding: `.rodata`, `.bss` (optionally `: [u8; 16]`).
     Section { kind: SectionKind, ty: Option<Ty>, span: Span },
+    /// A stack slot: `stack` (8 bytes) / `stack(N)` (§3). Lives in the
+    /// function frame (`rbp`-relative); only valid inside a function body.
+    Stack { size: Option<u32>, ty: Option<Ty>, span: Span },
+    /// A named group of places: `group(name)` (§3). Not a value — it expands
+    /// to its member places in `bind`/`alt`/`push`/`pop`.
+    Group { name: String, span: Span },
     /// Discard `_`.
     Discard { span: Span },
 }
@@ -98,6 +104,8 @@ impl Place {
             | Place::Mem { span, .. }
             | Place::Named { span, .. }
             | Place::Section { span, .. }
+            | Place::Stack { span, .. }
+            | Place::Group { span, .. }
             | Place::Discard { span } => *span,
         }
     }
@@ -109,8 +117,9 @@ impl Place {
             | Place::RegPair { ty, .. }
             | Place::Mem { ty, .. }
             | Place::Named { ty, .. }
-            | Place::Section { ty, .. } => ty.as_ref(),
-            Place::Discard { .. } => None,
+            | Place::Section { ty, .. }
+            | Place::Stack { ty, .. } => ty.as_ref(),
+            Place::Discard { .. } | Place::Group { .. } => None,
         }
     }
 
@@ -122,6 +131,7 @@ impl Place {
             Place::Mem { addr, span, .. } => Place::Mem { addr, ty, span },
             Place::Named { name, span, .. } => Place::Named { name, ty, span },
             Place::Section { kind, span, .. } => Place::Section { kind, ty, span },
+            Place::Stack { size, span, .. } => Place::Stack { size, ty, span },
             other => other,
         }
     }

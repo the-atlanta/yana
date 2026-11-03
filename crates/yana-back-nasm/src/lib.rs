@@ -228,6 +228,7 @@ fn insn_to_nasm(ins: &Insn, module: &Module, labels: &HashMap<usize, String>) ->
         Insn::Syscall => "syscall".to_string(),
         Insn::Ret => "ret".to_string(),
         Insn::Int3 => "int3".to_string(),
+        Insn::Ud2 => "ud2".to_string(),
         Insn::Nop => "nop".to_string(),
 
         // ---- §12: atomics / volatile ----

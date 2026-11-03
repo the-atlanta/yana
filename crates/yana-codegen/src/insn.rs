@@ -362,7 +362,13 @@ pub fn insn_info(i: &Insn) -> InsnInfo {
             // implicit: rsp written (return address), rip jumps; the contract
             // lists everything else the analysis must assume destroyed.
             InsnInfo {
-                reads: vec![r64(GprBase::Sp)],
+                reads: {
+                    // `call` pushes the return address; the callee reads its
+                    // argument registers before they can be considered dead.
+                    let mut r = vec![r64(GprBase::Sp)];
+                    r.extend(contract.args.iter().copied());
+                    r
+                },
                 writes: {
                     let mut w = vec![r64(GprBase::Sp)];
                     w.extend(contract.clobbers.iter().copied());
@@ -371,7 +377,9 @@ pub fn insn_info(i: &Insn) -> InsnInfo {
                 },
                 reads_mem: true,
                 writes_mem: true,
-                stack_delta: 0, // call+ret balance
+                // call+ret balance to 0; a callee that leaves its own pushes
+                // on the stack shifts the caller's rsp by that amount.
+                stack_delta: contract.stack_delta,
                 is_call: true,
                 is_terminator: contract.noreturn,
                 is_noreturn: contract.noreturn,
@@ -405,6 +413,7 @@ pub fn insn_info(i: &Insn) -> InsnInfo {
             ..base
         },
         Insn::Int3 => InsnInfo { is_terminator: true, is_noreturn: true, ..base },
+        Insn::Ud2 => InsnInfo { is_terminator: true, is_noreturn: true, ..base },
         Insn::Nop => base.clone(),
         // §12: locked RMW. Register-wise it writes nothing (the memory cell
         // is the destination); xchg-with-memory is implicitly locked and
@@ -481,9 +490,11 @@ pub fn derive_clobbers(body_insns: impl Iterator<Item = Insn>, fn_results: &[Reg
 pub fn syscall_contract(noreturn: bool) -> CallContract {
     CallContract {
         clobbers: vec![r64(GprBase::C), r64(GprBase::R11)],
+        args: vec![],
         results: if noreturn { vec![] } else { vec![r64(GprBase::A)] },
         noreturn,
         syscall: None, // filled by the resolver with the actual number
+        stack_delta: 0,
     }
 }
 
@@ -602,16 +613,26 @@ mod tests {
             sym: 0,
             contract: CallContract {
                 clobbers: vec![r64(GprBase::C)],
+                args: vec![r64(GprBase::D)],
                 results: vec![r64(GprBase::A)],
                 noreturn: false,
                 syscall: None,
+                stack_delta: 0,
             },
         });
         assert!(i.is_call && !i.is_terminator);
         assert!(i.writes.contains(&r64(GprBase::C)));
+        assert!(i.reads.contains(&r64(GprBase::D)), "argument registers are reads");
         let nr = insn_info(&Insn::Call {
             sym: 0,
-            contract: CallContract { clobbers: vec![], results: vec![], noreturn: true, syscall: None },
+            contract: CallContract {
+                clobbers: vec![],
+                args: vec![],
+                results: vec![],
+                noreturn: true,
+                syscall: None,
+                stack_delta: 0,
+            },
         });
         assert!(nr.is_terminator && nr.is_noreturn);
     }

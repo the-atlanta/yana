@@ -9,7 +9,7 @@ use yana_ast::reg::Reg;
 use yana_ast::{
     AssignOp, Attr, AttrArg, Block, BranchCond, CallArg, CallResults, CmpOp, ConstBinOp,
     ConstExpr, ConstFnItem, ConstItem, ConstUnOp, ExternFnItem, Flag, FnItem, FnSig, Item, Param,
-    Place, RetSig, Span, StaticBind, Stmt, Ty, Value,
+    Place, RetSig, Span, StaticBind, Stmt, StructDecl, StructField, Ty, Value,
 };
 use yana_ast::place::SectionKind;
 use yana_lexer::Token;
@@ -62,6 +62,23 @@ pub fn parse_str(raw: &str, span: Span) -> Result<Vec<u8>, PErr> {
     let body = &raw[1..raw.len() - 1];
     yana_lexer::unescape_string(body).map_err(|(off, _)| {
         user_err(Token::BadEscape(yana_lexer::token::BadLit::new(raw, span.lo + off as u32, span.hi)))
+    })
+}
+
+/// Parse a `b"..."` byte-string literal. `raw` includes the `b` prefix and
+/// the quotes; the body is unescaped exactly like a normal string.
+pub fn parse_byte_str(raw: &str, span: Span) -> Result<Vec<u8>, PErr> {
+    let body = raw
+        .strip_prefix("b\"")
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(raw);
+    yana_lexer::unescape_string(body).map_err(|(off, _)| {
+        // `b"` is two bytes before the body starts.
+        user_err(Token::BadEscape(yana_lexer::token::BadLit::new(
+            raw,
+            span.lo + 2 + off as u32,
+            span.hi,
+        )))
     })
 }
 
@@ -197,6 +214,7 @@ pub fn fn_item(
     params: Vec<Param>,
     ret: RetSig,
     clobbers: Option<yana_ast::Clobbers>,
+    preserves: Option<yana_ast::Clobbers>,
     contracts: yana_ast::Contracts,
     body: Block,
     lo: usize,
@@ -213,6 +231,7 @@ pub fn fn_item(
             span: Span::new(lo as u32, hi as u32),
         },
         clobbers,
+        preserves,
         contracts,
         body,
         span: Span::new(lo as u32, hi as u32),
@@ -227,6 +246,7 @@ pub fn extern_fn_item(
     params: Vec<Param>,
     ret: RetSig,
     clobbers: Option<yana_ast::Clobbers>,
+    preserves: Option<yana_ast::Clobbers>,
     contracts: yana_ast::Contracts,
     lo: usize,
     hi: usize,
@@ -242,10 +262,41 @@ pub fn extern_fn_item(
             span: Span::new(lo as u32, hi as u32),
         },
         clobbers,
+        preserves,
         contracts,
         span: Span::new(lo as u32, hi as u32),
     }
 }
+
+/// One parsed struct field: `name: Ty`.
+pub type StructFieldSp = (Sp<String>, Ty, Span);
+
+pub fn struct_field(name: Sp<String>, ty: Ty, lo: usize, hi: usize) -> StructFieldSp {
+    (name, ty, Span::new(lo as u32, hi as u32))
+}
+
+pub fn item_struct(
+    name: Sp<String>,
+    fields: Vec<StructFieldSp>,
+    lo: usize,
+    hi: usize,
+) -> Item {
+    Item::Struct(StructDecl {
+        name: name.v,
+        name_span: name.span,
+        fields: fields
+            .into_iter()
+            .map(|(n, ty, span)| StructField {
+                name: n.v,
+                name_span: n.span,
+                ty,
+                span,
+            })
+            .collect(),
+        span: Span::new(lo as u32, hi as u32),
+    })
+}
+
 
 /// One §14.4 contract clause: `requires <expr>;` or `ensures <expr>;`.
 pub fn contract_clause(kind: ContractKind, e: ConstExpr, lo: usize, hi: usize) -> (ContractKind, Sp<ConstExpr>) {
@@ -256,6 +307,7 @@ pub fn contract_clause(kind: ContractKind, e: ConstExpr, lo: usize, hi: usize) -
 pub enum ContractKind {
     Requires,
     Ensures,
+    Invariant,
 }
 
 /// Fold parsed clauses into a [`yana_ast::Contracts`].
@@ -265,6 +317,7 @@ pub fn contracts_of(clauses: Vec<(ContractKind, Sp<ConstExpr>)>) -> yana_ast::Co
         match kind {
             ContractKind::Requires => c.requires.push(sp),
             ContractKind::Ensures => c.ensures.push(sp),
+            ContractKind::Invariant => c.invariants.push(sp),
         }
     }
     c

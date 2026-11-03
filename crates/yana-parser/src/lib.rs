@@ -11,7 +11,7 @@ use yana_lexer::Token;
 
 pub mod gram;
 pub mod macros;
-pub use macros::ExpandResult;
+pub use macros::{ExpandResult, MacroExport};
 
 lalrpop_mod!(
     #[allow(clippy::all)]
@@ -39,6 +39,12 @@ impl ParseOutput {
 
 /// Parse `source` into a [`File`], collecting diagnostics.
 pub fn parse(source: &str) -> ParseOutput {
+    parse_with_prelude(source, &[])
+}
+
+/// Parse `source` with macros imported from other modules in scope (§10).
+/// The loader passes the `#[global]` macros named by `use` declarations.
+pub fn parse_with_prelude(source: &str, prelude: &[MacroExport]) -> ParseOutput {
     let lexed = yana_lexer::lex(source);
     let mut diagnostics = Vec::new();
 
@@ -61,7 +67,7 @@ pub fn parse(source: &str) -> ParseOutput {
     // (and after the PairReg collapse), before the LALRPOP parser — by parse
     // time all macro declarations and invocations are gone from the stream,
     // so the grammar stays macro-free (see docs/NOTES-macros.md).
-    let macro_out = macros::expand(triples);
+    let macro_out = macros::expand_with_prelude(triples, prelude);
     diagnostics.extend(macro_out.diagnostics);
 
     // Merge the expansion comments (§9.7: every expansion is signed) into the

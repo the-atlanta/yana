@@ -269,18 +269,23 @@ fn f() { forever!(); }
 }
 
 #[test]
-fn item_position_error() {
-    let kinds = diags(
+fn top_level_macro_expands_to_items() {
+    let out = parse(
         r#"
-macro m(a: value) { alt rax = a; }
-m!(1);
+macro mkfn(name: ident) {
+    fn hello() -> rax: u64 { alt rax = 42; return; }
+}
+mkfn!(ignored);
 fn f() { }
 "#,
     );
-    assert!(
-        kinds.iter().any(|k| k.contains("item-position")),
-        "{kinds:?}"
-    );
+    let kinds: Vec<_> = out.diagnostics.iter().map(|d| d.kind.clone()).collect();
+    assert!(!kinds.iter().any(|k| k.contains("item-position")), "{kinds:?}");
+    let file = out.file.expect("parses");
+    assert!(file
+        .items
+        .iter()
+        .any(|i| matches!(i, yana_ast::Item::Fn(f) if f.sig.name == "hello")));
 }
 
 // --- expansion comments -------------------------------------------------------
@@ -319,4 +324,80 @@ fn f() {
     );
     // no stray items: exactly one fn
     assert_eq!(file.items.len(), 1);
+}
+
+#[test]
+fn exported_macros_can_be_imported() {
+    let defs = yana_parser::macros::collect_exports(
+        r#"
+#[global]
+macro twice(x: value) { alt rax = x; alt rax += x; }
+macro hidden(y: value) { alt rax = y; }
+"#,
+    );
+    assert_eq!(defs.len(), 1);
+    assert_eq!(defs[0].name(), "twice");
+    assert!(yana_parser::macros::defines_macro(
+        r#"macro hidden(y: value) { alt rax = y; }"#,
+        "hidden"
+    ));
+
+    let out = yana_parser::parse_with_prelude(
+        r#"
+use defs::twice;
+fn f() { twice!(3); }
+"#,
+        &defs,
+    );
+    let errs: Vec<_> = out.diagnostics.iter().map(|d| &d.kind).collect();
+    assert!(errs.is_empty(), "{errs:?}");
+}
+
+#[test]
+fn variadic_declarative_macro_repeats_per_argument() {
+    let file = parse_ok(
+        r#"
+macro add_all(regs: place..) {
+    $( alt rax += regs; )*
+}
+fn f() { add_all!(1, 2, 3); }
+"#,
+    );
+    assert_eq!(fns(&file).len(), 1);
+}
+
+#[test]
+fn variadic_declarative_macro_splices_comma_list() {
+    parse_ok(
+        r#"
+macro save_all(regs: place..) {
+    push { regs };
+}
+fn f() { save_all!(rax, rbx, rcx); }
+"#,
+    );
+}
+
+#[test]
+fn variadic_plus_requires_an_argument() {
+    let kinds = diags(
+        r#"
+macro first(regs: place..) {
+    $( alt rax += regs; )+
+}
+fn f() { first!(); }
+"#,
+    );
+    assert!(kinds.iter().any(|k| k == "macro-arity"), "{kinds:?}");
+}
+
+#[test]
+fn variadic_must_be_last() {
+    let kinds = diags(
+        r#"
+macro bad(regs: place.., tail: value) { }
+fn f() { }
+"#,
+    );
+    assert!(kinds.iter().any(|k| k == "macro-syntax"), "{kinds:?}");
 }

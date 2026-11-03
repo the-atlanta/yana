@@ -42,6 +42,9 @@ struct Binding {
     operand: Operand,
     ty: Ty,
     mutable: bool,
+    /// `bind volatile` (§12): writes through this binding are wrapped in
+    /// [`Insn::Volatile`] so no analysis may elide them.
+    volatile: bool,
     span: Span,
 }
 
@@ -71,12 +74,30 @@ struct Resolver {
     // symbol tables
     statics: HashMap<String, StaticInfo>,
     consts: HashMap<String, i128>,
+    /// `struct` declarations before layout, and their laid-out forms (§8).
+    structs_raw: HashMap<String, RawStruct>,
+    structs: HashMap<String, StructDef>,
+    /// `const P: Point = ...;` values, keyed by const name (raw bytes).
+    struct_consts: HashMap<String, Vec<u8>>,
     fns: HashMap<String, FnInfo>,
     /// Names seeded by `use` imports (§10) — local declarations may not clash.
     imported_names: Vec<String>,
 
     // current function state
     scopes: Vec<HashMap<String, Binding>>,
+    /// Group aliases visible at each scope level (§3). Separate namespace from
+    /// `scopes`: a group is a compile-time list of places, not a value.
+    group_scopes: Vec<HashMap<String, GroupDef>>,
+    /// Top-level `group` declarations — visible in every function.
+    global_groups: HashMap<String, GroupDef>,
+    /// Frame slots allocated for `stack`/`stack(N)` places, keyed by source
+    /// span so that re-resolving the same place reuses its slot.
+    stack_slots: HashMap<(u32, u32), i64>,
+    /// Bytes allocated in the current function frame (0 → no prologue).
+    frame_used: u32,
+    /// The function has `stack` parameters → it needs `rbp` as a frame base
+    /// even when it allocates no local slots (§5.3).
+    needs_frame: bool,
     body: FnBody,
     /// label name → index into body.label_defs
     labels: HashMap<String, usize>,
@@ -94,12 +115,41 @@ struct ConstEnvOwned {
     consts: HashMap<String, CValue>,
 }
 
+/// A named group of places (§3) — a compile-time alias, never a value.
+#[derive(Debug, Clone)]
+struct GroupDef {
+    places: Vec<Place>,
+    span: Span,
+}
+
 #[derive(Debug, Clone)]
 struct StaticInfo {
     sym: usize,
     section: SectionKind,
     offset: u64,
     size: u64,
+}
+
+/// A `struct` declaration before layout is computed.
+#[derive(Debug, Clone)]
+struct RawStruct {
+    fields: Vec<(String, Ty, Span)>,
+    span: Span,
+}
+
+#[derive(Debug, Clone)]
+struct StructFieldDef {
+    name: String,
+    ty: Ty,
+    offset: u64,
+}
+
+/// Laid-out const-only struct (§8): C-like alignment/padding.
+#[derive(Debug, Clone)]
+struct StructDef {
+    fields: Vec<StructFieldDef>,
+    size: u64,
+    align: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +168,9 @@ struct ParamInfo {
     operand: Operand,
     ty: Ty,
     name: String,
+    /// `Some(rbp_offset)` for a stack parameter (§5.3): the caller pushes it,
+    /// the callee reads it at `[rbp + offset]`. Register params are `None`.
+    stack: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -126,6 +179,112 @@ enum RetInfo {
     Never,
     Single { operand: Operand, ty: Ty },
     Tuple { parts: Vec<ParamInfo> },
+}
+
+fn align_up(value: u64, align: u64) -> u64 {
+    if align <= 1 {
+        value
+    } else {
+        (value + align - 1) & !(align - 1)
+    }
+}
+
+/// Layout one type. Structs recurse into [`RawStruct`]; cycles and unknown
+/// names are reported as `(diagnostic kind, message, span)`.
+fn layout_ty(
+    ty: &Ty,
+    raws: &HashMap<String, RawStruct>,
+    usize_bits: u32,
+    stack: &mut Vec<String>,
+) -> Result<(u64, u64), (String, String, Span)> {
+    match ty {
+        Ty::Struct(name) => {
+            if stack.contains(name) {
+                let span = raws.get(name).map(|r| r.span).unwrap_or(Span::DUMMY);
+                return Err((
+                    "struct-cycle".into(),
+                    format!("struct `{name}` contains itself"),
+                    span,
+                ));
+            }
+            let Some(raw) = raws.get(name) else {
+                return Err((
+                    "unknown-struct".into(),
+                    format!("struct `{name}` is not declared"),
+                    Span::DUMMY,
+                ));
+            };
+            stack.push(name.clone());
+            let def = layout_struct_fields(&raw.fields, raws, usize_bits, stack)?;
+            stack.pop();
+            Ok((def.size, def.align))
+        }
+        Ty::Array(inner, n) => {
+            let (size, align) = layout_ty(inner, raws, usize_bits, stack)?;
+            Ok((size * n, align))
+        }
+        Ty::Tuple(items) => {
+            let fields: Vec<(String, Ty, Span)> = items
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (format!("{i}"), t.clone(), Span::DUMMY))
+                .collect();
+            let def = layout_struct_fields(&fields, raws, usize_bits, stack)?;
+            Ok((def.size, def.align))
+        }
+        _ => match ty.size_bits(usize_bits) {
+            Some(bits) => {
+                let size = (bits as u64 / 8).max(1);
+                Ok((size, size))
+            }
+            None => Err((
+                "struct-layout".into(),
+                format!("type {ty:?} has no fixed size"),
+                Span::DUMMY,
+            )),
+        },
+    }
+}
+
+fn layout_struct_fields(
+    fields: &[(String, Ty, Span)],
+    raws: &HashMap<String, RawStruct>,
+    usize_bits: u32,
+    stack: &mut Vec<String>,
+) -> Result<StructDef, (String, String, Span)> {
+    let mut offset = 0u64;
+    let mut align = 1u64;
+    let mut out = Vec::new();
+    for (name, ty, span) in fields {
+        let (size, a) = layout_ty(ty, raws, usize_bits, stack).map_err(|(k, m, s)| {
+            let s = if s.is_dummy() { *span } else { s };
+            (k, m, s)
+        })?;
+        offset = align_up(offset, a);
+        out.push(StructFieldDef { name: name.clone(), ty: ty.clone(), offset });
+        offset += size;
+        align = align.max(a);
+    }
+    Ok(StructDef { fields: out, size: align_up(offset, align), align })
+}
+
+fn layout_struct_named(
+    name: &str,
+    raws: &HashMap<String, RawStruct>,
+    usize_bits: u32,
+    stack: &mut Vec<String>,
+) -> Result<StructDef, (String, String, Span)> {
+    let Some(raw) = raws.get(name) else {
+        return Err((
+            "unknown-struct".into(),
+            format!("struct `{name}` is not declared"),
+            Span::DUMMY,
+        ));
+    };
+    stack.push(name.to_string());
+    let def = layout_struct_fields(&raw.fields, raws, usize_bits, stack)?;
+    stack.pop();
+    Ok(def)
 }
 
 fn ty_bits(ty: &Ty, target: &TargetInfo) -> u32 {
@@ -139,8 +298,16 @@ impl Resolver {
             const_fns: HashMap::new(),
             statics: HashMap::new(),
             consts: HashMap::new(),
+            structs_raw: HashMap::new(),
+            structs: HashMap::new(),
+            struct_consts: HashMap::new(),
             fns: HashMap::new(),
             scopes: Vec::new(),
+            group_scopes: Vec::new(),
+            global_groups: HashMap::new(),
+            stack_slots: HashMap::new(),
+            frame_used: 0,
+            needs_frame: false,
             body: FnBody::default(),
             labels: HashMap::new(),
             pending_jumps: Vec::new(),
@@ -195,6 +362,8 @@ impl Resolver {
                         exported: false,
                         syscall: None,
                         clobbers: vec![],
+                        preserves: vec![],
+                        naked: false,
                         contracts: FnContracts::default(),
                         span: Span::DUMMY,
                     });
@@ -211,6 +380,8 @@ impl Resolver {
                         exported: true,
                         syscall: None,
                         clobbers: vec![],
+                        preserves: vec![],
+                        naked: false,
                         contracts: FnContracts::default(),
                         span: Span::DUMMY,
                     });
@@ -255,6 +426,24 @@ impl Resolver {
     }
 
     fn collect_decls(&mut self, file: &File) {
+        // struct declarations first: static/const layout needs them (§8).
+        for item in &file.items {
+            if let Item::Struct(s) = item {
+                self.collect_struct(s);
+            }
+        }
+        self.compute_struct_layouts();
+
+        // Struct constants must be evaluated before statics: a static can be
+        // initialised from a struct constant (`bind p @ .rodata: Point = P;`).
+        for item in &file.items {
+            if let Item::Const(c) = item {
+                if matches!(c.ty, Ty::Struct(_)) {
+                    self.eval_const(c);
+                }
+            }
+        }
+
         // statics + consts + const fns first (bodies may reference them)
         for item in &file.items {
             match item {
@@ -263,14 +452,18 @@ impl Resolver {
                 Item::ConstFn(f) => {
                     self.const_fns.insert(f.name.clone(), f.clone());
                 }
+                Item::Group(g) => self.declare_group(g, true),
                 _ => {}
             }
         }
         // evaluate consts (may reference other consts — single pass in decl order;
-        // forward refs error for MVP)
+        // forward refs error for MVP). Struct consts were evaluated above,
+        // before statics.
         for item in &file.items {
             if let Item::Const(c) = item {
-                self.eval_const(c);
+                if !matches!(c.ty, Ty::Struct(_)) {
+                    self.eval_const(c);
+                }
             }
         }
         // functions and externs → symbols
@@ -283,6 +476,8 @@ impl Resolver {
                     None,
                     false,
                     f.clobbers.as_ref().map(|c| c.regs.clone()).unwrap_or_default(),
+                    f.preserves.as_ref().map(|c| c.regs.clone()).unwrap_or_default(),
+                    f.is_naked(),
                     f.contracts.clone(),
                     f.span,
                 ),
@@ -296,6 +491,8 @@ impl Resolver {
                         syscall,
                         true,
                         e.clobbers.as_ref().map(|c| c.regs.clone()).unwrap_or_default(),
+                        e.preserves.as_ref().map(|c| c.regs.clone()).unwrap_or_default(),
+                        false,
                         e.contracts.clone(),
                         e.span,
                     );
@@ -306,6 +503,195 @@ impl Resolver {
                     }
                 }
                 _ => {}
+            }
+        }
+    }
+
+    /// Collect a `struct` declaration; layout is computed after all structs
+    /// are known (fields may refer to structs declared later).
+    fn collect_struct(&mut self, s: &yana_ast::StructDecl) {
+        if self.structs_raw.contains_key(&s.name) {
+            self.err(
+                "struct-duplicate",
+                format!("struct `{}` is declared twice", s.name),
+                s.name_span,
+            );
+            return;
+        }
+        let mut seen: Vec<&str> = Vec::new();
+        let mut fields = Vec::new();
+        for f in &s.fields {
+            if seen.contains(&f.name.as_str()) {
+                self.err(
+                    "struct-field",
+                    format!("struct `{}` has duplicate field `{}`", s.name, f.name),
+                    f.name_span,
+                );
+                continue;
+            }
+            seen.push(&f.name);
+            fields.push((f.name.clone(), f.ty.clone(), f.span));
+        }
+        self.structs_raw.insert(
+            s.name.clone(),
+            RawStruct { fields, span: s.span },
+        );
+    }
+
+    fn compute_struct_layouts(&mut self) {
+        let names: Vec<String> = self.structs_raw.keys().cloned().collect();
+        for name in names {
+            let mut stack = Vec::new();
+            match layout_struct_named(
+                &name,
+                &self.structs_raw,
+                self.target.usize_bits(),
+                &mut stack,
+            ) {
+                Ok(def) => {
+                    self.structs.insert(name, def);
+                }
+                Err((kind, msg, span)) => self.err(&kind, msg, span),
+            }
+        }
+    }
+
+    /// Size and alignment of a type, resolving struct/array/tuple layouts.
+    fn ty_size_align(&self, ty: &Ty) -> Option<(u64, u64)> {
+        match ty {
+            Ty::Struct(name) => self.structs.get(name).map(|d| (d.size, d.align)),
+            Ty::Array(inner, n) => {
+                let (size, align) = self.ty_size_align(inner)?;
+                Some((size.checked_mul(*n)?, align))
+            }
+            Ty::Tuple(items) => {
+                let mut off = 0u64;
+                let mut align = 1u64;
+                for t in items {
+                    let (size, a) = self.ty_size_align(t)?;
+                    off = align_up(off, a);
+                    off += size;
+                    align = align.max(a);
+                }
+                Some((align_up(off, align), align))
+            }
+            _ => {
+                let bits = ty.size_bits(self.target.usize_bits())?;
+                let size = (bits as u64 / 8).max(1);
+                Some((size, size))
+            }
+        }
+    }
+
+    /// Encode a const-only struct literal. Structs use positional
+    /// construction: `Point(1, 2)` in field declaration order (§8).
+    fn struct_value_bytes(
+        &mut self,
+        expr: &yana_ast::ConstExpr,
+        ty: &Ty,
+        span: Span,
+    ) -> Result<Vec<u8>, ()> {
+        let Ty::Struct(name) = ty else {
+            self.err("struct-init", "expected a struct type", span);
+            return Err(());
+        };
+        let Some(def) = self.structs.get(name).cloned() else {
+            self.err(
+                "unknown-struct",
+                format!("struct `{name}` is not declared"),
+                span,
+            );
+            return Err(());
+        };
+        match expr {
+            yana_ast::ConstExpr::Name { name: other, span: nspan } => {
+                if let Some(bytes) = self.struct_consts.get(other) {
+                    Ok(bytes.clone())
+                } else {
+                    self.err(
+                        "struct-init",
+                        format!("`{other}` is not a struct constant of type `{name}`"),
+                        *nspan,
+                    );
+                    Err(())
+                }
+            }
+            yana_ast::ConstExpr::Call { name: ctor, args, span: espan } => {
+                if ctor != name {
+                    self.err(
+                        "struct-init",
+                        format!("expected `{name}(...)`, got `{ctor}(...)`"),
+                        *espan,
+                    );
+                    return Err(());
+                }
+                if args.len() != def.fields.len() {
+                    self.err(
+                        "struct-init-arity",
+                        format!(
+                            "struct `{name}` has {} field(s), got {} initializer(s)",
+                            def.fields.len(),
+                            args.len()
+                        ),
+                        *espan,
+                    );
+                    return Err(());
+                }
+                let mut bytes = vec![0u8; def.size as usize];
+                for (field, arg) in def.fields.iter().zip(args.iter()) {
+                    let fb = self.field_value_bytes(arg, &field.ty, span)?;
+                    let off = field.offset as usize;
+                    if off + fb.len() > bytes.len() {
+                        self.err(
+                            "struct-init",
+                            format!("field `{}` does not fit in struct `{name}`", field.name),
+                            span,
+                        );
+                        return Err(());
+                    }
+                    bytes[off..off + fb.len()].copy_from_slice(&fb);
+                }
+                Ok(bytes)
+            }
+            _ => {
+                self.err(
+                    "struct-init",
+                    format!("struct `{name}` needs a constructor `{name}(...)`"),
+                    span,
+                );
+                Err(())
+            }
+        }
+    }
+
+    fn field_value_bytes(
+        &mut self,
+        expr: &yana_ast::ConstExpr,
+        ty: &Ty,
+        span: Span,
+    ) -> Result<Vec<u8>, ()> {
+        if matches!(ty, Ty::Struct(_)) {
+            return self.struct_value_bytes(expr, ty, span);
+        }
+        match self.eval_const_expr(expr) {
+            Ok(v) => {
+                if let (CValue::Int(i), Some(bits)) =
+                    (&v, ty.size_bits(self.target.usize_bits()))
+                {
+                    if !imm_fits(*i, bits, ty.is_signed()) {
+                        self.err(
+                            "struct-init-type",
+                            format!("value {i} does not fit in field type {ty:?}"),
+                            expr_span(expr),
+                        );
+                        return Err(());
+                    }
+                }
+                Ok(self.const_to_bytes(&v, ty))
+            }
+            Err(d) => {
+                self.diagnostics.push(d);
+                Err(())
             }
         }
     }
@@ -345,8 +731,23 @@ impl Resolver {
                 if section != SectionKind::Bss {
                     // allowed but zero-filled; keep in .bss semantics
                 }
-                (None, ty_bits(inner, &self.target) as u64 / 8 * n)
+                let elem = self
+                    .ty_size_align(inner)
+                    .map(|(size, _)| size)
+                    .unwrap_or_else(|| ty_bits(inner, &self.target) as u64 / 8);
+                (None, elem * n)
             }
+            (None, Ty::Struct(_)) => match self.ty_size_align(&ty) {
+                Some((size, _)) => (None, size),
+                None => {
+                    self.err(
+                        "unknown-struct",
+                        format!("cannot lay out struct type {ty:?}"),
+                        s.span,
+                    );
+                    return;
+                }
+            },
             (None, _) => {
                 self.err(
                     "static-init",
@@ -357,7 +758,10 @@ impl Resolver {
             }
         };
 
-        let align = (ty_bits(&ty, &self.target) / 8).max(1) as u64;
+        let align = self
+            .ty_size_align(&ty)
+            .map(|(_, a)| a)
+            .unwrap_or_else(|| (ty_bits(&ty, &self.target) / 8).max(1) as u64);
         let sec = self.module.section_mut(section);
         let offset = next_offset(sec, align);
 
@@ -369,6 +773,8 @@ impl Resolver {
             exported: s.attrs.iter().any(|a| a.has_name("global")),
             syscall: None,
             clobbers: vec![],
+            preserves: vec![],
+            naked: false,
             contracts: FnContracts::default(),
             span: s.span,
         });
@@ -386,15 +792,33 @@ impl Resolver {
     /// Compute initializer bytes; Err(()) after emitting a diagnostic.
     fn init_bytes(&mut self, init: &Value, ty: &Ty, span: Span) -> Result<Vec<u8>, ()> {
         match init {
-            Value::Str { bytes, .. } => Ok(bytes.clone()),
+            Value::Str { bytes, .. } | Value::Bytes { bytes, .. } => Ok(bytes.clone()),
             Value::Imm { value, .. } => Ok(imm_to_bytes(*value, ty, &self.target)),
-            Value::Const { expr, .. } => match self.eval_const_expr(expr) {
-                Ok(v) => Ok(self.const_to_bytes(&v, ty)),
-                Err(d) => {
-                    self.diagnostics.push(d);
-                    Err(())
+            Value::Const { expr, .. } => {
+                if matches!(ty, Ty::Struct(_)) {
+                    return self.struct_value_bytes(expr, ty, span);
                 }
-            },
+                match self.eval_const_expr(expr) {
+                    Ok(v) => Ok(self.const_to_bytes(&v, ty)),
+                    Err(d) => {
+                        self.diagnostics.push(d);
+                        Err(())
+                    }
+                }
+            }
+            Value::Place(Place::Named { name, .. }) if matches!(ty, Ty::Struct(_)) => {
+                match self.struct_consts.get(name) {
+                    Some(bytes) => Ok(bytes.clone()),
+                    None => {
+                        self.err(
+                            "struct-init",
+                            format!("`{name}` is not a struct constant"),
+                            span,
+                        );
+                        Err(())
+                    }
+                }
+            }
             other => {
                 self.err(
                     "static-init",
@@ -444,6 +868,8 @@ impl Resolver {
             exported: false,
             syscall: None,
             clobbers: vec![],
+            preserves: vec![],
+            naked: false,
             contracts: FnContracts::default(),
             span: c.span,
         });
@@ -452,6 +878,20 @@ impl Resolver {
     }
 
     fn eval_const(&mut self, c: &yana_ast::ConstItem) {
+        if matches!(c.ty, Ty::Struct(_)) {
+            if self.struct_consts.contains_key(&c.name) {
+                return;
+            }
+            // Const-only struct value: store its bytes for static initializers.
+            // The symbol itself was registered by `collect_const`.
+            match self.struct_value_bytes(&c.value, &c.ty, c.span) {
+                Ok(bytes) => {
+                    self.struct_consts.insert(c.name.clone(), bytes);
+                }
+                Err(()) => {}
+            }
+            return;
+        }
         match self.eval_const_expr(&c.value) {
             Ok(v) => {
                 let i = v.as_int().unwrap_or(0);
@@ -499,7 +939,7 @@ impl Resolver {
         clobbers: Vec<Reg>,
         span: Span,
     ) {
-        self.collect_fn_with_contracts(sig, exported, is_entry, syscall, is_extern, clobbers, yana_ast::Contracts::default(), span)
+        self.collect_fn_with_contracts(sig, exported, is_entry, syscall, is_extern, clobbers, vec![], false, yana_ast::Contracts::default(), span)
     }
 
     fn collect_fn_with_contracts(
@@ -510,6 +950,8 @@ impl Resolver {
         syscall: Option<i64>,
         is_extern: bool,
         clobbers: Vec<Reg>,
+        preserves: Vec<Reg>,
+        naked: bool,
         ast_contracts: yana_ast::Contracts,
         span: Span,
     ) {
@@ -531,15 +973,52 @@ impl Resolver {
             format!("{}{}", self.target.symbol_prefix(), sig.name)
         };
 
+        // §5.3: register params first, then stack params in declaration
+        // order at [rbp+16], [rbp+24], ... (the SysV layout).
+        let mut stack_off = 16u32;
+        let mut has_stack_param = false;
         let params: Vec<ParamInfo> = sig
             .params
             .iter()
-            .map(|p| ParamInfo {
-                operand: self.param_operand(p),
-                ty: p.ty().cloned().unwrap_or(Ty::U64),
-                name: p.name.clone(),
+            .map(|p| {
+                let ty = p.ty().cloned().unwrap_or(Ty::U64);
+                let mut stack = None;
+                let operand = if let Place::Stack { size, .. } = &p.place {
+                    has_stack_param = true;
+                    let bits = p
+                        .place
+                        .ty()
+                        .map(|t| ty_bits(t, &self.target))
+                        .or_else(|| size.map(|n| n * 8))
+                        .unwrap_or(64);
+                    let slot = ((bits / 8).max(1) + 7) & !7;
+                    let off = stack_off;
+                    stack_off += slot;
+                    stack = Some(off);
+                    Operand::Mem(MemOp {
+                        base: Some(Reg::Gpr {
+                            base: yana_ast::reg::GprBase::Bp,
+                            size: yana_ast::reg::RegSize::R64,
+                        }),
+                        index: None,
+                        scale: 1,
+                        disp: Displacement::Const(off as i64),
+                        size: bits,
+                        rip_relative: false,
+                    })
+                } else {
+                    self.param_operand(p)
+                };
+                ParamInfo { operand, ty, name: p.name.clone(), stack }
             })
             .collect();
+        if is_extern && has_stack_param {
+            self.err(
+                "stack-param-extern",
+                "`extern fn` cannot take `stack` parameters — the ABI is not ours to define",
+                sig.span,
+            );
+        }
 
         let ret: RetInfo = match &sig.ret {
             RetSig::None => RetInfo::None,
@@ -555,6 +1034,7 @@ impl Resolver {
                         operand: self.param_operand(p),
                         ty: p.ty().cloned().unwrap_or(Ty::U64),
                         name: p.name.clone(),
+                        stack: None,
                     })
                     .collect(),
             },
@@ -580,6 +1060,8 @@ impl Resolver {
             exported: exported || is_entry || syscall.is_some(),
             syscall,
             clobbers: if syscall.is_some() { vec![Reg::parse("rcx").unwrap(), Reg::parse("r11").unwrap()] } else { clobbers },
+            preserves,
+            naked,
             contracts,
             span,
         });
@@ -591,6 +1073,27 @@ impl Resolver {
             sig.name.clone(),
             FnInfo { sym: sym_idx, params, ret, syscall, real_call: false },
         );
+    }
+
+    /// "Did you mean" suffix for an unknown name (§11): the closest visible
+    /// binding, function, static, const, group, or label.
+    fn suggest(&self, needle: &str) -> String {
+        let mut cands: Vec<&str> = Vec::new();
+        for scope in &self.scopes {
+            cands.extend(scope.keys().map(String::as_str));
+        }
+        cands.extend(self.fns.keys().map(String::as_str));
+        cands.extend(self.statics.keys().map(String::as_str));
+        cands.extend(self.consts.keys().map(String::as_str));
+        cands.extend(self.global_groups.keys().map(String::as_str));
+        for scope in &self.group_scopes {
+            cands.extend(scope.keys().map(String::as_str));
+        }
+        cands.extend(self.labels.keys().map(String::as_str));
+        match yana_ast::text::closest(needle, cands) {
+            Some(s) => format!("; did you mean `{s}`?"),
+            None => String::new(),
+        }
     }
 
     fn param_operand(&self, p: &Param) -> Operand {
@@ -633,6 +1136,7 @@ impl Resolver {
         let mut out = FnContracts {
             requires: Vec::new(),
             ensures: Vec::new(),
+            invariants: Vec::new(),
             params: params.clone(),
             results: results.clone(),
         };
@@ -647,6 +1151,15 @@ impl Resolver {
             allowed.extend(results.iter().cloned());
             if self.check_contract_expr(&sp.v, &allowed, &results) {
                 out.ensures.push((sp.v.clone(), sp.span));
+            }
+        }
+        for sp in &c.invariants {
+            // Invariants may mention parameters and results: entry checks see
+            // parameters, exit checks see results.
+            let mut allowed: Vec<(String, Reg)> = params.clone();
+            allowed.extend(results.iter().cloned());
+            if self.check_contract_expr(&sp.v, &allowed, &results) {
+                out.invariants.push((sp.v.clone(), sp.span));
             }
         }
         out
@@ -750,22 +1263,41 @@ impl Resolver {
             result_regs,
             returns_never,
             reg_names: std::collections::HashMap::new(),
+            stack_delta: 0,
         };
         self.labels.clear();
         self.pending_jumps.clear();
         self.scopes.clear();
+        self.group_scopes.clear();
+        self.stack_slots.clear();
+        self.frame_used = 0;
+        self.needs_frame = false;
         self.cur_ret = f.sig.ret.clone();
         self.cur_fn_span = f.span;
         self.push_scope();
 
-        // params become bindings
-        for p in &f.sig.params {
+        // params become bindings; stack params carry their [rbp+N] operand
+        self.needs_frame = info.params.iter().any(|p| p.stack.is_some());
+        for (p, pinfo) in f.sig.params.iter().zip(info.params.iter()) {
             let ty = p.ty().cloned().unwrap_or(Ty::U64);
-            let operand = self.param_operand(p);
-            self.define(p.name.clone(), Binding { operand, ty, mutable: p.mutable, span: p.span });
+            let operand = pinfo.operand.clone();
+            self.define(p.name.clone(), Binding { operand, ty, mutable: p.mutable, volatile: false, span: p.span });
         }
 
         self.lower_block(&f.body);
+        if f.is_naked() {
+            // §5.6: no compiler-generated prologue/epilogue.
+            if self.frame_used > 0 {
+                self.err_help(
+                    "naked-frame",
+                    "`#[naked]` function uses a `stack` slot, but the frame is not emitted",
+                    "allocate the frame by hand (`push`/`sub rsp`) or drop `stack` places",
+                    f.span,
+                );
+            }
+        } else {
+            self.apply_frame();
+        }
 
         // backpatch jumps and record branch uses with scope depths (§6 check
         // lives in the analysis pass: jumping into a nested block is illegal)
@@ -780,7 +1312,7 @@ impl Resolver {
                 }
                 None => self.err(
                     "unknown-label",
-                    format!("label '{name} is not defined in this function"),
+                    format!("label '{name} is not defined in this function{}", self.suggest(&name)),
                     span,
                 ),
             }
@@ -813,6 +1345,16 @@ impl Resolver {
             _ => vec![],
         };
         let noreturn = matches!(info.ret, RetInfo::Never);
+        // Argument registers: liveness needs them as reads of the call, or a
+        // `mov rdi, ...` that only feeds a call looks like a dead store.
+        let args: Vec<Reg> = info
+            .params
+            .iter()
+            .filter_map(|p| match &p.operand {
+                Operand::Reg(r) => Some(r.resize(yana_ast::reg::RegSize::R64).unwrap_or(*r)),
+                _ => None,
+            })
+            .collect();
         // clobbers: externs must declare them (§5.4); we stored declared ones
         // on the Symbol; local fns get derived clobbers after analysis (pass 3)
         // — until then, conservatively: everything the callee's symbol lists.
@@ -822,7 +1364,14 @@ impl Resolver {
             .get(info.sym)
             .map(|s| s.clobbers.clone())
             .unwrap_or_default();
-        CallContract { clobbers, results, noreturn, syscall: info.syscall }
+        CallContract {
+            clobbers,
+            args,
+            results,
+            noreturn,
+            syscall: info.syscall,
+            stack_delta: 0, // inferred by the stack analysis pass
+        }
     }
 
     fn has_errors(&self) -> bool {
@@ -831,14 +1380,28 @@ impl Resolver {
 
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
+        self.group_scopes.push(HashMap::new());
     }
     fn pop_scope(&mut self) {
         self.scopes.pop();
+        self.group_scopes.pop();
     }
     fn define(&mut self, name: String, b: Binding) {
         if let Some(top) = self.scopes.last_mut() {
             top.insert(name, b);
         }
+    }
+    fn define_group(&mut self, name: String, g: GroupDef) {
+        if let Some(top) = self.group_scopes.last_mut() {
+            top.insert(name, g);
+        }
+    }
+    fn lookup_group(&self, name: &str) -> Option<&GroupDef> {
+        self.group_scopes
+            .iter()
+            .rev()
+            .find_map(|s| s.get(name))
+            .or_else(|| self.global_groups.get(name))
     }
     fn lookup(&self, name: &str) -> Option<&Binding> {
         self.scopes.iter().rev().find_map(|s| s.get(name))
@@ -858,9 +1421,37 @@ impl Resolver {
     fn lower_stmt(&mut self, s: &Stmt) {
         self.cur_span = stmt_span(s);
         match s {
-            Stmt::Bind { mutable, name, name_span, place, init, pattern, span } => {
+            Stmt::Group(g) => self.declare_group(g, false),
+            Stmt::Breakpoint { .. } => {
+                self.emit(Insn::Int3);
+            }
+            Stmt::Trap { .. } => {
+                self.emit(Insn::Ud2);
+            }
+            Stmt::Assert { cond, .. } => self.lower_assert(cond),
+            Stmt::Debug(b) => {
+                if self.opts.debug {
+                    self.push_scope();
+                    self.lower_block(b);
+                    self.pop_scope();
+                }
+            }
+            Stmt::Bind { mutable, volatile, name, name_span, place, init, pattern, span } => {
                 if let Some(pat) = pattern {
                     self.lower_bind_pattern(pat, init.as_ref(), *span);
+                    return;
+                }
+                // `bind name @ group(g) = b"...";` — a group alias, not a value.
+                if let Place::Group { name: gname, span: gspan } = place {
+                    let Some(def) = self.lookup_group(gname).cloned() else {
+                        self.err("unknown-group", format!("group `{gname}` is not declared{}", self.suggest(gname)), *gspan);
+                        return;
+                    };
+                    if let Some(n) = name {
+                        self.define_group(n.clone(), def.clone());
+                    }
+                    let Some(v) = init else { return };
+                    self.lower_group_write(&def, v, *span);
                     return;
                 }
                 let name = match name {
@@ -947,21 +1538,42 @@ impl Resolver {
                     self.body.reg_names.insert(r64, name.clone());
                 }
                 if !is_wildcard {
-                    self.define(name, Binding { operand: operand.clone(), ty, mutable: *mutable, span: *span });
+                    self.define(
+                        name,
+                        Binding {
+                            operand: operand.clone(),
+                            ty,
+                            mutable: *mutable,
+                            volatile: *volatile,
+                            span: *span,
+                        },
+                    );
                 }
                 if let Some(v) = init {
                     // initial write: no `alt` needed (§4.2)
+                    let before = self.body.insns.len();
                     self.lower_write(&operand, &ty_for_init, v, *span);
+                    if *volatile {
+                        self.wrap_volatile(before);
+                    }
                 }
             }
             Stmt::Alt { dst, op, src, modifier, span } => {
-                self.lower_alt(dst, *op, src, modifier, *span)
+                let vol = *modifier == AltModifier::None
+                    && matches!(dst, Place::Named { name, .. }
+                        if self.lookup(name).map(|b| b.volatile).unwrap_or(false));
+                let before = self.body.insns.len();
+                self.lower_alt(dst, *op, src, modifier, *span);
+                if vol {
+                    self.wrap_volatile(before);
+                }
             }
             Stmt::DivMod { results, dividend, divisor, span } => {
                 self.lower_divmod(results, dividend, divisor, *span)
             }
             Stmt::Push { items, span } => {
-                for it in items {
+                let items = self.expand_group_items(items, true, *span);
+                for it in &items {
                     match it {
                         Place::Discard { .. } => {
                             self.emit(Insn::StackSlot { grow: true });
@@ -978,7 +1590,8 @@ impl Resolver {
                 }
             }
             Stmt::Pop { items, span } => {
-                for it in items {
+                let items = self.expand_group_items(items, false, *span);
+                for it in &items {
                     match it {
                         Place::Discard { .. } => {
                             self.emit(Insn::StackSlot { grow: false });
@@ -1075,7 +1688,112 @@ impl Resolver {
     // alt / writes
     // ------------------------------------------------------------------
 
+    /// Wrap every instruction emitted since `before` in [`Insn::Volatile`]
+    /// (§12) — used by `bind volatile` and by volatile bindings' writes.
+    fn wrap_volatile(&mut self, before: usize) {
+        for si in &mut self.body.insns[before..] {
+            if !matches!(si.insn, Insn::Volatile(_)) {
+                si.insn = Insn::Volatile(Box::new(std::mem::replace(&mut si.insn, Insn::Nop)));
+            }
+        }
+    }
+
+    /// `assert (cond);` (§4.6) — `ud2` when the condition does not hold:
+    /// `cmp; j<inverted> over; ud2; over:`.
+    fn lower_assert(&mut self, cond: &BranchCond) {
+        let cc = match cond {
+            BranchCond::Cmp { lhs, op, rhs, .. } => {
+                let signed = self.cmp_signedness(lhs, rhs);
+                let (mut a, sa) = match self.resolve_value(lhs) {
+                    Some(v) => v,
+                    None => return,
+                };
+                let (mut b, _) = match self.resolve_value(rhs) {
+                    Some(v) => v,
+                    None => return,
+                };
+                let mut op = *op;
+                // `cmp` has no imm,imm form: constant-fold or swap.
+                match (&a, &b) {
+                    (Operand::Imm(x), Operand::Imm(y)) => {
+                        let ok = match op {
+                            yana_ast::CmpOp::Eq => x == y,
+                            yana_ast::CmpOp::Ne => x != y,
+                            yana_ast::CmpOp::Lt => x < y,
+                            yana_ast::CmpOp::Le => x <= y,
+                            yana_ast::CmpOp::Gt => x > y,
+                            yana_ast::CmpOp::Ge => x >= y,
+                        };
+                        if !ok {
+                            self.emit(Insn::Ud2);
+                        }
+                        return;
+                    }
+                    (Operand::Imm(_), _) => {
+                        std::mem::swap(&mut a, &mut b);
+                        op = match op {
+                            yana_ast::CmpOp::Eq => yana_ast::CmpOp::Eq,
+                            yana_ast::CmpOp::Ne => yana_ast::CmpOp::Ne,
+                            yana_ast::CmpOp::Lt => yana_ast::CmpOp::Gt,
+                            yana_ast::CmpOp::Le => yana_ast::CmpOp::Ge,
+                            yana_ast::CmpOp::Gt => yana_ast::CmpOp::Lt,
+                            yana_ast::CmpOp::Ge => yana_ast::CmpOp::Le,
+                        };
+                    }
+                    _ => {}
+                }
+                let size = sa.max(8);
+                self.emit(Insn::Cmp { a, b, size });
+                let inverted = match op {
+                    yana_ast::CmpOp::Eq => yana_ast::CmpOp::Ne,
+                    yana_ast::CmpOp::Ne => yana_ast::CmpOp::Eq,
+                    yana_ast::CmpOp::Lt => yana_ast::CmpOp::Ge,
+                    yana_ast::CmpOp::Le => yana_ast::CmpOp::Gt,
+                    yana_ast::CmpOp::Gt => yana_ast::CmpOp::Le,
+                    yana_ast::CmpOp::Ge => yana_ast::CmpOp::Lt,
+                };
+                insn::cmp_cc(inverted, signed)
+            }
+            BranchCond::Flag { flag, negated, .. } => insn::flag_cc(*flag, !negated),
+        };
+        let def = self.body.label_defs.len();
+        self.body.label_defs.push(LabelDef {
+            name: format!("$assert{def}"),
+            at_insn: self.body.insns.len() + 2,
+            scope_depth: self.scopes.len() as u32,
+        });
+        self.emit(Insn::Jcc { cc, label: def });
+        self.emit(Insn::Ud2);
+    }
+
     fn lower_alt(&mut self, dst: &Place, op: AssignOp, src: &Value, modifier: &AltModifier, span: Span) {
+        // A group destination is an alias for several places: `alt g = b"...";`
+        // (also via a name bound with `bind n @ group(g)`).
+        let group = match dst {
+            Place::Group { name, span: gspan } => match self.lookup_group(name).cloned() {
+                Some(g) => Some(g),
+                None => {
+                    self.err("unknown-group", format!("group `{name}` is not declared{}", self.suggest(name)), *gspan);
+                    None
+                }
+            },
+            Place::Named { name, .. } if self.lookup(name).is_none() => {
+                self.lookup_group(name).cloned()
+            }
+            _ => None,
+        };
+        if let Some(g) = group {
+            if op != AssignOp::Assign {
+                self.err("group-op", "a group can only be assigned with `=`", span);
+                return;
+            }
+            if *modifier != AltModifier::None {
+                self.err("group-modifier", "§12 modifiers are not supported on a group yet", span);
+                return;
+            }
+            self.lower_group_write(&g, src, span);
+            return;
+        }
         // §12 modifiers take their own lowering path (the atomic path applies
         // the mut/alt contract itself, and additionally admits static-bound
         // names — those are anonymous memory, not bindings).
@@ -1100,7 +1818,7 @@ impl Resolver {
                     return;
                 }
                 None => {
-                    self.err("unknown-name", format!("`{name}` is not bound here"), span);
+                    self.err("unknown-name", format!("`{name}` is not bound here{}", self.suggest(name)), span);
                     return;
                 }
                 _ => {}
@@ -1302,7 +2020,7 @@ impl Resolver {
                     return;
                 }
                 None => {
-                    self.err("unknown-name", format!("`{name}` is not bound here"), span);
+                    self.err("unknown-name", format!("`{name}` is not bound here{}", self.suggest(name)), span);
                     return;
                 }
                 _ => {}
@@ -1504,7 +2222,7 @@ impl Resolver {
         let info = match self.fns.get(name) {
             Some(i) => i.clone(),
             None => {
-                self.err("unknown-call", format!("no function or extern named `{name}`"), name_span);
+                self.err("unknown-call", format!("no function or extern named `{name}`{}", self.suggest(name)), name_span);
                 return;
             }
         };
@@ -1533,8 +2251,59 @@ impl Resolver {
             }
         }
 
+        // §5.3 stack arguments: pushed right-to-left before the register
+        // args, so the callee sees them at [rbp+16], [rbp+24], ... The caller
+        // cleans them up after the call.
+        let mut stack_slots = 0u32;
+        for (p, slot) in info.params.iter().zip(slots.iter()).rev() {
+            if p.stack.is_none() {
+                continue;
+            }
+            let Some(a) = slot else { continue };
+            if ty_bits(&p.ty, &self.target) > 64 {
+                self.err_help(
+                    "stack-arg-too-big",
+                    format!("stack argument `{}` is wider than 8 bytes", p.name),
+                    "pass a pointer to the value instead",
+                    a.span,
+                );
+                continue;
+            }
+            let src = match &a.value {
+                Value::AddrOf { .. } => {
+                    self.err(
+                        "stack-arg-addr",
+                        "address arguments need a register parameter",
+                        a.span,
+                    );
+                    continue;
+                }
+                v => match self.resolve_value(v) {
+                    Some((op, _)) => op,
+                    None => continue,
+                },
+            };
+            match &src {
+                Operand::Imm(v) if *v < i32::MIN as i64 || *v > i32::MAX as i64 => {
+                    self.err_help(
+                        "stack-arg-imm",
+                        "this immediate does not fit the `push imm32` form",
+                        "bind it to a register first",
+                        a.span,
+                    );
+                    continue;
+                }
+                _ => {}
+            }
+            self.emit(Insn::Push { src, size: 64 });
+            stack_slots += 1;
+        }
+
         // emit argument movs
         for (p, slot) in info.params.iter().zip(slots.iter()) {
+            if p.stack.is_some() {
+                continue;
+            }
             let Some(a) = slot else { continue };
             // explicit place assertion: `{ n: v @ rdi }`
             if let Some(at) = &a.at {
@@ -1590,6 +2359,11 @@ impl Resolver {
             self.emit(Insn::Call { sym: info.sym, contract });
         }
 
+        // §5.3 caller cleanup: drop the stack arguments.
+        for _ in 0..stack_slots {
+            self.emit(Insn::StackSlot { grow: false });
+        }
+
         // results (§5.3)
         if let Some(res) = results {
             self.bind_results(res, &info, span);
@@ -1601,7 +2375,7 @@ impl Resolver {
             (CallResults::Single { name: Some(n), .. }, RetInfo::Single { operand, ty }) => {
                 self.define(
                     n.clone(),
-                    Binding { operand: operand.clone(), ty: ty.clone(), mutable: false, span },
+                    Binding { operand: operand.clone(), ty: ty.clone(), mutable: false, volatile: false, span },
                 );
             }
             (CallResults::Single { name: Some(n), .. }, RetInfo::None) => {
@@ -1622,6 +2396,7 @@ impl Resolver {
                                 operand: part.operand.clone(),
                                 ty: part.ty.clone(),
                                 mutable: false,
+                                volatile: false,
                                 span,
                             },
                         );
@@ -1705,6 +2480,11 @@ impl Resolver {
                 .map(|b| b.size_bits(&self.target))
                 .unwrap_or(64),
             Place::Section { .. } | Place::Discard { .. } => 64,
+            Place::Stack { size, ty, .. } => ty
+                .as_ref()
+                .map(|t| ty_bits(t, &self.target))
+                .unwrap_or_else(|| size.map(|s| s * 8).unwrap_or(64)),
+            Place::Group { .. } => 64,
         }
     }
 
@@ -1744,11 +2524,28 @@ impl Resolver {
                 if let Some(v) = self.consts.get(name) {
                     return Some(Operand::Imm(*v as i64));
                 }
-                self.err("unknown-name", format!("`{name}` is not bound here"), *span);
+                self.err("unknown-name", format!("`{name}` is not bound here{}", self.suggest(name)), *span);
                 None
             }
             Place::Section { span, .. } => {
                 self.err("section-place", "a section is not an operand", *span);
+                None
+            }
+            Place::Stack { size, ty, span } => {
+                let bits = ty
+                    .as_ref()
+                    .map(|t| ty_bits(t, &self.target))
+                    .unwrap_or_else(|| size.map(|s| s * 8).unwrap_or(64));
+                let bytes = (bits / 8).max(1);
+                Some(Operand::Mem(self.stack_slot(bytes, bits, *span)))
+            }
+            Place::Group { name, span } => {
+                self.err_help(
+                    "group-place",
+                    format!("`group({name})` is not a single place"),
+                    "use it with `bind`/`alt`/`push`/`pop`, where it expands to its members",
+                    *span,
+                );
                 None
             }
             Place::Discard { span } => {
@@ -1840,7 +2637,7 @@ impl Resolver {
                     } else if let Some(v) = self.consts.get(name) {
                         disp_const += *v as i64;
                     } else {
-                        self.err("unknown-name", format!("`{name}` is not bound here"), raw.span);
+                        self.err("unknown-name", format!("`{name}` is not bound here{}", self.suggest(name)), raw.span);
                     }
                 }
                 MemTerm::Const(c) => disp_const += *c,
@@ -1897,10 +2694,28 @@ impl Resolver {
                 self.resolve_place(p).map(|o| (o, size))
             }
             Value::Imm { value, .. } => Some((Operand::Imm(*value as i64), 64)),
+            Value::Bytes { bytes, span } => {
+                if bytes.len() > 8 {
+                    self.err_help(
+                        "byte-string-too-long",
+                        format!(
+                            "byte string is {} bytes; an immediate is at most 8",
+                            bytes.len()
+                        ),
+                        "bind the bytes in .rodata and pass their address instead",
+                        *span,
+                    );
+                    return None;
+                }
+                let mut buf = [0u8; 8];
+                buf[..bytes.len()].copy_from_slice(bytes);
+                Some((Operand::Imm(i64::from_le_bytes(buf)), 64))
+            }
             Value::Str { span, .. } => {
-                self.err(
+                self.err_help(
                     "str-value",
                     "string literals live in static data; bind it to .rodata first (§7)",
+                    "use `b\"...\"` for a ≤8-byte immediate",
                     *span,
                 );
                 None
@@ -1987,7 +2802,7 @@ impl Resolver {
                         _ => {}
                     }
                 }
-                self.err("unknown-name", format!("`{name}` is not bound here"), *span);
+                self.err("unknown-name", format!("`{name}` is not bound here{}", self.suggest(name)), *span);
                 None
             }
             Place::Mem { addr, .. } => Some(LeaSrc::Mem(self.resolve_addr(addr, 64))),
@@ -2029,6 +2844,316 @@ impl Resolver {
         }
     }
 
+    // =====================================================================
+    // Groups and frame slots (§3)
+    // =====================================================================
+
+    /// Validate and register a `group (name) | places |;` declaration.
+    fn declare_group(&mut self, g: &yana_ast::GroupDecl, global: bool) {
+        let mut places: Vec<Place> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+        let mut ok = true;
+        for p in &g.places {
+            match p {
+                Place::Reg { reg, span, .. } => {
+                    if seen.iter().any(|r| r == reg.name()) {
+                        self.err(
+                            "group-dup-reg",
+                            format!("register `{}` appears twice in group `{}`", reg.name(), g.name),
+                            *span,
+                        );
+                        ok = false;
+                    }
+                    seen.push(reg.name().to_string());
+                    places.push(p.clone());
+                }
+                Place::Stack { .. } => places.push(p.clone()),
+                other => {
+                    self.err_help(
+                        "group-member",
+                        "a group member must be a register or `stack`/`stack(N)`",
+                        "e.g. `group (buf) | rax, stack(16), rbx |;`",
+                        other.span(),
+                    );
+                    ok = false;
+                }
+            }
+        }
+        if places.is_empty() {
+            self.err("group-empty", format!("group `{}` has no places", g.name), g.span);
+            ok = false;
+        }
+        if !ok {
+            return;
+        }
+        let def = GroupDef { places, span: g.span };
+        if global {
+            if self.global_groups.insert(g.name.clone(), def).is_some() {
+                self.err(
+                    "dup-group",
+                    format!("group `{}` is already declared", g.name),
+                    g.name_span,
+                );
+            }
+        } else if let Some(top) = self.group_scopes.last_mut() {
+            if top.insert(g.name.clone(), def).is_some() {
+                self.err(
+                    "dup-group",
+                    format!("group `{}` is already declared in this scope", g.name),
+                    g.name_span,
+                );
+            }
+        }
+    }
+
+    /// Size of one group chunk in bytes (a register's width or a slot's size).
+    fn place_bytes(&self, p: &Place) -> Option<u32> {
+        match p {
+            Place::Reg { reg, .. } => Some(reg.size().bits() / 8),
+            Place::Stack { size, ty, .. } => Some(
+                ty.as_ref()
+                    .map(|t| ty_bits(t, &self.target) / 8)
+                    .unwrap_or_else(|| size.unwrap_or(8)),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Expand `group(name)` items into their member places. `reverse` is used
+    /// by `push` so that the bytes end up in memory in declaration order.
+    fn expand_group_items(&mut self, items: &[Place], reverse: bool, span: Span) -> Vec<Place> {
+        let mut out = Vec::new();
+        for it in items {
+            let def = match it {
+                Place::Group { name, span: gspan } => match self.lookup_group(name).cloned() {
+                    Some(g) => Some(g),
+                    None => {
+                        self.err("unknown-group", format!("group `{name}` is not declared{}", self.suggest(name)), *gspan);
+                        None
+                    }
+                },
+                _ => None,
+            };
+            let Some(def) = def else {
+                out.push(it.clone());
+                continue;
+            };
+            if def.places.iter().any(|p| matches!(p, Place::Stack { .. })) {
+                self.err_help(
+                    "group-stack-push",
+                    "a group with `stack` slots cannot be pushed or popped",
+                    "the slots already live in the frame; push/pop only register members",
+                    span,
+                );
+                continue;
+            }
+            let mut members = def.places.clone();
+            if reverse {
+                members.reverse();
+            }
+            out.extend(members);
+        }
+        out
+    }
+
+    /// Extract the bytes an initializer provides, plus whether `.aligned` was
+    /// requested (zero-fill the remaining group places).
+    fn bytes_of_value(&mut self, v: &Value) -> Option<(Vec<u8>, bool)> {
+        match v {
+            Value::Bytes { bytes, .. } => Some((bytes.clone(), false)),
+            Value::Field { base, name, span } if name == "aligned" => match base.as_ref() {
+                Value::Bytes { bytes, .. } => Some((bytes.clone(), true)),
+                _ => {
+                    self.err("aligned-base", "`.aligned` needs a `b\"...\"` byte string", *span);
+                    None
+                }
+            },
+            Value::Const { expr, .. } => match self.eval_const_expr(expr) {
+                Ok(CValue::Int(i)) => Some((i.to_le_bytes().to_vec(), false)),
+                Ok(CValue::Array(items)) => Some((
+                    items.iter().map(|b| b.as_int().unwrap_or(0) as u8).collect(),
+                    false,
+                )),
+                Ok(_) => {
+                    self.err("group-init", "a group needs a byte-string initializer", v.span());
+                    None
+                }
+                Err(d) => {
+                    self.diagnostics.push(d);
+                    None
+                }
+            },
+            other => {
+                self.err_help(
+                    "group-init",
+                    format!(
+                        "a group needs a byte-string initializer, got {}",
+                        init_kind_name(other)
+                    ),
+                    "e.g. `bind g @ group(buf) = b\"text\";`",
+                    other.span(),
+                );
+                None
+            }
+        }
+    }
+
+    /// Distribute the bytes of a `b"..."` value over a group's places.
+    ///
+    /// Chunk order follows the declaration order; each chunk is little-endian
+    /// and zero-padded to the member width. Members that receive no bytes are
+    /// left untouched unless `.aligned` asks for a full zero-fill.
+    fn lower_group_write(&mut self, g: &GroupDef, v: &Value, span: Span) {
+        let Some((bytes, aligned)) = self.bytes_of_value(v) else { return };
+        let mut cap = 0u32;
+        for p in &g.places {
+            cap += self.place_bytes(p).unwrap_or(0);
+        }
+        if bytes.len() as u32 > cap {
+            self.err_help(
+                "byte-string-too-long",
+                format!("byte string is {} bytes but the group holds only {cap}", bytes.len()),
+                "use a bigger group, `.aligned`, or bind the bytes in .rodata",
+                span,
+            );
+            return;
+        }
+        let mut pos = 0usize;
+        for p in &g.places {
+            let n = self.place_bytes(p).unwrap_or(0) as usize;
+            if pos >= bytes.len() && !aligned {
+                break;
+            }
+            let start = pos.min(bytes.len());
+            let end = (pos + n).min(bytes.len());
+            let chunk = &bytes[start..end];
+            pos += n;
+            let Some(dst) = self.resolve_place(p) else { continue };
+            let bits = (n * 8) as u32;
+            match dst {
+                Operand::Reg(_) => {
+                    let mut buf = [0u8; 8];
+                    let take = chunk.len().min(8);
+                    buf[..take].copy_from_slice(&chunk[..take]);
+                    self.emit(Insn::Mov {
+                        dst,
+                        src: Operand::Imm(i64::from_le_bytes(buf)),
+                        size: bits,
+                    });
+                }
+                Operand::Mem(m) => {
+                    // `mov [mem], imm64` does not exist (the imm32 form is
+                    // sign-extended), so store exact 4-byte pieces instead of
+                    // burning a scratch register.
+                    let mut off = 0usize;
+                    while off < n {
+                        let piece = (n - off).min(4);
+                        let mut buf = [0u8; 4];
+                        let avail = chunk.len().saturating_sub(off).min(piece);
+                        if avail > 0 {
+                            buf[..avail].copy_from_slice(&chunk[off..off + avail]);
+                        }
+                        let mut m2 = m.clone();
+                        if let Displacement::Const(d) = m2.disp {
+                            m2.disp = Displacement::Const(d + off as i64);
+                        }
+                        self.emit(Insn::Mov {
+                            dst: Operand::Mem(m2),
+                            src: Operand::Imm(u32::from_le_bytes(buf) as i64),
+                            size: (piece * 8) as u32,
+                        });
+                        off += piece;
+                    }
+                }
+                _ => self.err("group-dst", "this group member is not writable", p.span()),
+            }
+        }
+    }
+
+    /// Allocate (or reuse) a frame slot and return its `[rbp - off]` operand.
+    fn stack_slot(&mut self, bytes: u32, bits: u32, span: Span) -> MemOp {
+        let key = (span.lo, span.hi);
+        let off = match self.stack_slots.get(&key) {
+            Some(o) => *o,
+            None => {
+                self.frame_used = (self.frame_used + 7) & !7;
+                self.frame_used += bytes.max(1);
+                let off = self.frame_used as i64;
+                self.stack_slots.insert(key, off);
+                off
+            }
+        };
+        MemOp {
+            base: Some(Reg::Gpr {
+                base: yana_ast::reg::GprBase::Bp,
+                size: yana_ast::reg::RegSize::R64,
+            }),
+            index: None,
+            scale: 1,
+            disp: Displacement::Const(-off),
+            size: bits,
+            rip_relative: false,
+        }
+    }
+
+    /// Wrap the lowered body in a frame when it uses `stack` slots:
+    /// `push rbp; mov rbp, rsp; sub rsp, N` … `mov rsp, rbp; pop rbp` before
+    /// every `ret`. Functions without slots stay zero-overhead.
+    fn apply_frame(&mut self) {
+        if self.frame_used == 0 && !self.needs_frame {
+            return;
+        }
+        let size = (self.frame_used + 15) & !15;
+        let rsp = Reg::Gpr {
+            base: yana_ast::reg::GprBase::Sp,
+            size: yana_ast::reg::RegSize::R64,
+        };
+        let rbp = Reg::Gpr {
+            base: yana_ast::reg::GprBase::Bp,
+            size: yana_ast::reg::RegSize::R64,
+        };
+        let span = self.cur_fn_span;
+
+        let old = std::mem::take(&mut self.body.insns);
+        let mut map = vec![0usize; old.len()];
+        let mut out: Vec<SpannedInsn> = Vec::with_capacity(old.len() + 8);
+        out.push(SpannedInsn::new(Insn::Push { src: Operand::Reg(rbp), size: 64 }, span));
+        // mov rbp, rsp — the frame base
+        out.push(SpannedInsn::new(
+            Insn::Mov { dst: Operand::Reg(rbp), src: Operand::Reg(rsp), size: 64 },
+            span,
+        ));
+        if size > 0 {
+            out.push(SpannedInsn::new(
+                Insn::Sub { dst: Operand::Reg(rsp), src: Operand::Imm(size as i64), size: 64 },
+                span,
+            ));
+        }
+        for (i, si) in old.into_iter().enumerate() {
+            if matches!(si.insn, Insn::Ret) {
+                out.push(SpannedInsn::new(
+                    Insn::Mov { dst: Operand::Reg(rsp), src: Operand::Reg(rbp), size: 64 },
+                    si.span,
+                ));
+                out.push(SpannedInsn::new(Insn::Pop { dst: Operand::Reg(rbp), size: 64 }, si.span));
+            }
+            map[i] = out.len();
+            out.push(si);
+        }
+        self.body.insns = out;
+
+        for (idx, ..) in self.pending_jumps.iter_mut() {
+            if let Some(&m) = map.get(*idx) {
+                *idx = m;
+            }
+        }
+        for def in &mut self.body.label_defs {
+            if let Some(&m) = map.get(def.at_insn) {
+                def.at_insn = m;
+            }
+        }
+    }
+
     fn lower_bind_pattern(&mut self, pat: &[Param], init: Option<&Value>, span: Span) {
         let Some(init) = init else {
             self.err("bind-init", "destructuring bind needs an initializer", span);
@@ -2058,6 +3183,7 @@ impl Resolver {
                                 operand: self.param_operand(p),
                                 ty,
                                 mutable: p.mutable,
+                                volatile: false,
                                 span: p.span,
                             },
                         );
@@ -2094,6 +3220,9 @@ fn stmt_span(s: &Stmt) -> Span {
         | Stmt::Syscall { span, .. }
         | Stmt::Label { span, .. } => *span,
         Stmt::Nested(b) => b.span,
+        Stmt::Group(g) => g.span,
+        Stmt::Breakpoint { span } | Stmt::Trap { span } | Stmt::Assert { span, .. } => *span,
+        Stmt::Debug(b) => b.span,
     }
 }
 
@@ -2187,6 +3316,7 @@ fn init_kind_name(v: &Value) -> &'static str {
         Value::Place(_) => "place",
         Value::Imm { .. } => "immediate",
         Value::Str { .. } => "string",
+        Value::Bytes { .. } => "byte string",
         Value::AddrOf { .. } => "address-of",
         Value::Cast { .. } => "cast",
         Value::Mul { .. } => "wide multiply",
@@ -2203,6 +3333,7 @@ fn contract_shape_name(e: &yana_ast::ConstExpr) -> &'static str {
         yana_ast::ConstExpr::Array { .. } => "array literal",
         yana_ast::ConstExpr::Tuple { .. } => "tuple literal",
         yana_ast::ConstExpr::Repeat { .. } => "repeat literal",
+        yana_ast::ConstExpr::Bytes { .. } => "byte string",
         _ => "expression",
     }
 }
@@ -2218,7 +3349,8 @@ fn expr_span(e: &yana_ast::ConstExpr) -> Span {
         | yana_ast::ConstExpr::Call { span, .. }
         | yana_ast::ConstExpr::Array { span, .. }
         | yana_ast::ConstExpr::Tuple { span, .. }
-        | yana_ast::ConstExpr::Repeat { span, .. } => *span,
+        | yana_ast::ConstExpr::Repeat { span, .. }
+        | yana_ast::ConstExpr::Bytes { span, .. } => *span,
     }
 }
 

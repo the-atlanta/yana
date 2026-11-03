@@ -202,3 +202,48 @@ fn loader_missing_root_file_is_error() {
     let res = loader.load(Path::new("/nonexistent/nope.yana"), false);
     assert!(res.is_err(), "missing root must be Err: {res:?}");
 }
+
+// ---------------------------------------------------------------------------
+// macro imports (§10 / F13)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn imported_macro_expands_and_builds() {
+    if !ld_available() {
+        eprintln!("skipping: ld not available");
+        return;
+    }
+    let out = std::env::temp_dir().join(format!("yana-test-macmod-{}", std::process::id()));
+    let code = yana_cli::run([
+        "yana",
+        "build",
+        fixtures().join("main_macro.yana").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "build failed");
+    let status = Command::new(&out).status().expect("execute");
+    assert_eq!(status.code(), Some(42));
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn imported_macro_loader_has_no_diagnostics() {
+    let loader = load(&fixtures().join("main_macro.yana"));
+    assert!(
+        loader.diags.is_empty(),
+        "diags: {:?}",
+        loader.diags.iter().map(|d| (&d.diag.kind, &d.diag.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn hidden_macro_import_is_rejected() {
+    let loader = load(&fixtures().join("main_macro_hidden.yana"));
+    let d = loader
+        .diags
+        .iter()
+        .find(|d| d.diag.kind == "unresolved-import")
+        .expect("unresolved-import");
+    assert!(d.diag.message.contains("not exported"), "{}", d.diag.message);
+}

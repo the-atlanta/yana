@@ -59,6 +59,10 @@ pub struct Symbol {
     /// ABI default rcx/r11); functions derive it from the body in the
     /// analysis pass and this field is filled in afterwards.
     pub clobbers: Vec<Reg>,
+    /// `preserves: ...` (§5.4) — registers the function must not destroy.
+    pub preserves: Vec<Reg>,
+    /// `#[naked]` (§5.6) — no compiler-generated frame, no stack-balance check.
+    pub naked: bool,
     /// §14.4 minimal contracts (`requires`/`ensures`) — pass 4 reads these
     /// by symbol index at call sites and function exits.
     pub contracts: FnContracts,
@@ -118,6 +122,11 @@ pub struct FnBody {
     /// wins). Liveness uses this to keep dead-store quiet for `_`-prefixed
     /// bindings — an intentional sink, Rust's `_` convention (SPEC §11 ✅).
     pub reg_names: std::collections::HashMap<Reg, String>,
+    /// Net change to `rsp` over the whole body, in bytes (negative = the
+    /// function leaves bytes pushed, i.e. the caller's stack is deeper after
+    /// the call). `0` means balanced. Filled by stack analysis (pass 3) and
+    /// copied into [`CallContract::stack_delta`] at every call site.
+    pub stack_delta: i32,
 }
 
 /// The §14.4 contract clauses of one function symbol, resolved to IR-level
@@ -134,6 +143,9 @@ pub struct FnContracts {
     pub requires: Vec<(yana_ast::ConstExpr, Span)>,
     /// `ensures <expr>;` clauses with their source spans.
     pub ensures: Vec<(yana_ast::ConstExpr, Span)>,
+    /// `invariant <expr>;` clauses: checked at call sites (entry) and at
+    /// every exit, like a `requires` + `ensures` pair (§14.4).
+    pub invariants: Vec<(yana_ast::ConstExpr, Span)>,
     /// Parameter name → register (signature order; non-register places are
     /// omitted — they cannot carry integer contract values).
     pub params: Vec<(String, Reg)>,
@@ -144,7 +156,7 @@ pub struct FnContracts {
 
 impl FnContracts {
     pub fn is_empty(&self) -> bool {
-        self.requires.is_empty() && self.ensures.is_empty()
+        self.requires.is_empty() && self.ensures.is_empty() && self.invariants.is_empty()
     }
 }
 
@@ -195,12 +207,19 @@ pub struct BranchUse {
 pub struct CallContract {
     /// Registers the callee may destroy (§5.4).
     pub clobbers: Vec<Reg>,
+    /// Argument registers the callee reads, normalized to 64-bit (§5.1).
+    /// Liveness treats them as reads of the call instruction.
+    pub args: Vec<Reg>,
     /// Result registers, in signature order (§5.1).
     pub results: Vec<Reg>,
     /// `-> !` — never returns; the call is a terminator.
     pub noreturn: bool,
     /// Syscall number when this call lowers to `mov rax,N; syscall`.
     pub syscall: Option<i64>,
+    /// Net change to `rsp` caused by the call, in bytes (negative = the callee
+    /// leaves bytes on the stack). `0` until stack analysis infers the
+    /// callee's [`FnBody::stack_delta`].
+    pub stack_delta: i32,
 }
 
 /// An instruction operand.
@@ -367,6 +386,8 @@ pub enum Insn {
     Ret,
     /// `int3` — fallthrough guard for `-> !` and debug traps.
     Int3,
+    /// `ud2` — `trap;` (§4.6): deliberate unreachable.
+    Ud2,
     Nop,
 
     // ---- §12: atomics / volatile ----

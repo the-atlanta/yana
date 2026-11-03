@@ -598,6 +598,7 @@ fn build_insn_inner(
         Insn::Syscall => zero_op(Code::Syscall),
         Insn::Ret => zero_op(Code::Retnq),
         Insn::Int3 => zero_op(Code::Int3),
+        Insn::Ud2 => zero_op(Code::Ud2),
         Insn::Nop => zero_op(Code::Nopd),
 
         // ---- §12: atomic / volatile ----

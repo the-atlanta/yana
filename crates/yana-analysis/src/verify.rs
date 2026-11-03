@@ -374,7 +374,8 @@ fn xfer(insn: &Insn, st: &mut State, ctx: &Ctx, diags: &mut Vec<Diagnostic>, spa
         Insn::Lea { dst, .. } | Insn::LeaSym { dst, .. } => st.set(*dst, TOP),
         Insn::Push { .. } => st.mem_alive = false,
         Insn::StackSlot { .. } | Insn::StackAlign { .. } | Insn::StackPad { .. } | Insn::Nop
-        | Insn::Int3 | Insn::Ret | Insn::Jmp { .. } | Insn::Jcc { .. } | Insn::Cmp { .. } => {}
+        | Insn::Int3 | Insn::Ud2 | Insn::Ret | Insn::Jmp { .. } | Insn::Jcc { .. }
+        | Insn::Cmp { .. } => {}
         Insn::Pop { dst, .. } => set_dst(dst, TOP, st),
         Insn::Xchg { a, b, .. } => {
             let (va, vb) = (op_val(a, st, ctx), op_val(b, st, ctx));
@@ -841,7 +842,8 @@ pub fn smt_of(e: &ConstExpr) -> Option<String> {
         | ConstExpr::Call { .. }
         | ConstExpr::Array { .. }
         | ConstExpr::Tuple { .. }
-        | ConstExpr::Repeat { .. } => None,
+        | ConstExpr::Repeat { .. }
+        | ConstExpr::Bytes { .. } => None,
     }
 }
 
@@ -933,6 +935,31 @@ fn extract_value(text: &str, var: &str) -> Option<String> {
 // Contract checks (visitor over the second walk)
 // ---------------------------------------------------------------------------
 
+/// Does the expression mention any of `names`? Used to skip call-site
+/// invariant checks that refer to result registers (unknown before the call).
+fn expr_mentions_any(e: &ConstExpr, names: &[String]) -> bool {
+    match e {
+        ConstExpr::Name { name, .. } => names.iter().any(|n| n == name),
+        ConstExpr::Unary { expr, .. } => expr_mentions_any(expr, names),
+        ConstExpr::Binary { lhs, rhs, .. } => {
+            expr_mentions_any(lhs, names) || expr_mentions_any(rhs, names)
+        }
+        ConstExpr::If { cond, then_b, else_b, .. } => {
+            expr_mentions_any(cond, names)
+                || expr_mentions_any(then_b, names)
+                || expr_mentions_any(else_b, names)
+        }
+        ConstExpr::Call { args, .. } => args.iter().any(|a| expr_mentions_any(a, names)),
+        ConstExpr::Array { items, .. } | ConstExpr::Tuple { items, .. } => {
+            items.iter().any(|a| expr_mentions_any(a, names))
+        }
+        ConstExpr::Repeat { value, count, .. } => {
+            expr_mentions_any(value, names) || expr_mentions_any(count, names)
+        }
+        ConstExpr::Int { .. } | ConstExpr::Bool { .. } | ConstExpr::Bytes { .. } => false,
+    }
+}
+
 struct Visitor<'a> {
     module: &'a Module,
     body: &'a FnBody,
@@ -951,11 +978,18 @@ impl<'a> Visitor<'a> {
         Some(format!("(assert (and (>= {v} {}) (<= {v} {})))", iv.lo, iv.hi))
     }
 
-    fn check_call(&mut self, sym: usize, span: Span, st: &State) {
-        let Some(callee) = self.module.symbols.get(sym) else { return };
-        if callee.contracts.requires.is_empty() {
-            return;
-        }
+    /// Check one `requires`/`invariant` clause at a call site.
+    fn check_call_clause(
+        &mut self,
+        callee_name: &str,
+        params: &[(String, Reg)],
+        clause: &ConstExpr,
+        cspan: Span,
+        span: Span,
+        st: &State,
+        kind: &str,
+        label: &str,
+    ) {
         let Some(z3) = self.z3 else {
             if !self.smt_warned {
                 self.smt_warned = true;
@@ -968,73 +1002,80 @@ impl<'a> Visitor<'a> {
             }
             return;
         };
-        for (clause, cspan) in &callee.contracts.requires {
-            let Some(formula) = smt_of(clause) else {
+        let Some(formula) = smt_of(clause) else {
+            self.diags.push(
+                Diagnostic::warn(
+                    DiagCode::Semantic,
+                    "verify-contract-expr",
+                    "contract expression has no SMT encoding (bitwise op or non-const shape) — check skipped",
+                    cspan,
+                )
+                .with_note("keep contract expressions to + - * div mod comparisons && || on parameters/results (NOTES-verify D9)"),
+            );
+            return;
+        };
+        // variables: callee parameter names; facts from the CALLER state
+        let mut script = String::from("(set-logic QF_NIA)\n");
+        let mut vars = Vec::new();
+        for (pname, preg) in params {
+            let v = format!("v_{}", sanitize(pname));
+            vars.push(v.clone());
+            script.push_str(&format!("(declare-const {v} Int)\n"));
+            let fact = st.get(*preg);
+            if let Some(a) = Self::interval_assert(pname, fact) {
+                script.push_str(&a);
+                script.push('\n');
+            }
+        }
+        script.push_str(&format!("(assert (not {formula}))\n(check-sat)\n"));
+        if !vars.is_empty() {
+            script.push_str(&format!("(get-value ({}))\n", vars.join(" ")));
+        }
+        match z3.run(&script, &vars) {
+            Some((true, model)) => {
                 self.diags.push(
-                    Diagnostic::warn(
-                        DiagCode::Semantic,
-                        "verify-contract-expr",
-                        "contract expression has no SMT encoding (bitwise op or non-const shape) — check skipped",
-                        *cspan,
+                    Diagnostic::error(
+                        DiagCode::Contract,
+                        kind,
+                        format!(
+                            "call to `{callee_name}` violates its {} contract{}",
+                            if kind == "verify-invariant" { "`invariant`" } else { "`requires`" },
+                            if model.is_empty() { String::new() } else { format!(" — counterexample: {model}") }
+                        ),
+                        span,
                     )
-                    .with_note("keep contract expressions to + - * div mod comparisons && || on parameters/results (NOTES-verify D9)"),
+                    .with_label(label, cspan, false),
                 );
-                continue;
-            };
-            // variables: callee parameter names; facts from the CALLER state
-            let mut script = String::from("(set-logic QF_NIA)\n");
-            let mut vars = Vec::new();
-            for (pname, preg) in &callee.contracts.params {
-                let v = format!("v_{}", sanitize(pname));
-                vars.push(v.clone());
-                script.push_str(&format!("(declare-const {v} Int)\n"));
-                let fact = st.get(*preg);
-                if let Some(a) = Self::interval_assert(pname, fact) {
-                    script.push_str(&a);
-                    script.push('\n');
-                }
             }
-            script.push_str(&format!("(assert (not {formula}))\n(check-sat)\n"));
-            if !vars.is_empty() {
-                script.push_str(&format!("(get-value ({}))\n", vars.join(" ")));
-            }
-            match z3.run(&script, &vars) {
-                Some((true, model)) => {
-                    self.diags.push(
-                        Diagnostic::error(
-                            DiagCode::Contract,
-                            "verify-requires",
-                            format!(
-                                "call to `{}` violates its `requires` contract{}",
-                                callee.name,
-                                if model.is_empty() { String::new() } else { format!(" — counterexample: {model}") }
-                            ),
-                            span,
-                        )
-                        .with_label("the callee requires this at entry", *cspan, false),
-                    );
-                }
-                Some((false, _)) => {} // proven
-                None => {
-                    if !self.smt_warned {
-                        self.smt_warned = true;
-                        self.diags.push(Diagnostic::warn(
-                            DiagCode::Semantic,
-                            "verify-smt-unavailable",
-                            "z3 timed out or failed — remaining contract checks skipped",
-                            span,
-                        ));
-                    }
+            Some((false, _)) => {} // proven
+            None => {
+                if !self.smt_warned {
+                    self.smt_warned = true;
+                    self.diags.push(Diagnostic::warn(
+                        DiagCode::Semantic,
+                        "verify-smt-unavailable",
+                        "z3 timed out or failed — remaining contract checks skipped",
+                        span,
+                    ));
                 }
             }
         }
     }
 
-    fn check_exits(&mut self, exit_state: &State, exit_span: Span, what: &str) {
-        let sym = &self.module.symbols[self.body.symbol];
-        if sym.contracts.ensures.is_empty() {
-            return;
-        }
+    /// Check one `ensures`/`invariant` clause at an exit.
+    fn check_exit_clause(
+        &mut self,
+        fn_name: &str,
+        params: &[(String, Reg)],
+        results: &[(String, Reg)],
+        clause: &ConstExpr,
+        cspan: Span,
+        exit_state: &State,
+        exit_span: Span,
+        what: &str,
+        kind: &str,
+        label: &str,
+    ) {
         let Some(z3) = self.z3 else {
             if !self.smt_warned {
                 self.smt_warned = true;
@@ -1047,71 +1088,157 @@ impl<'a> Visitor<'a> {
             }
             return;
         };
-        for (clause, cspan) in &sym.contracts.ensures {
-            let Some(formula) = smt_of(clause) else {
-                self.diags.push(Diagnostic::warn(
+        let Some(formula) = smt_of(clause) else {
+            self.diags.push(
+                Diagnostic::warn(
                     DiagCode::Semantic,
                     "verify-contract-expr",
                     "contract expression has no SMT encoding (bitwise op or non-const shape) — check skipped",
-                    *cspan,
-                ));
-                continue;
-            };
-            let mut script = String::from("(set-logic QF_NIA)\n");
-            let mut vars = Vec::new();
-            // parameters: value AT ENTRY — unknown → unconstrained (D-plan)
-            for (pname, _) in &sym.contracts.params {
-                let v = format!("v_{}", sanitize(pname));
+                    cspan,
+                )
+                .with_note("keep contract expressions to + - * div mod comparisons && || on parameters/results (NOTES-verify D9)"),
+            );
+            return;
+        };
+        let mut script = String::from("(set-logic QF_NIA)\n");
+        let mut vars = Vec::new();
+        // parameters: value AT ENTRY — unknown → unconstrained (D-plan)
+        for (pname, _) in params {
+            let v = format!("v_{}", sanitize(pname));
+            vars.push(v.clone());
+            script.push_str(&format!("(declare-const {v} Int)\n"));
+        }
+        // results: interval facts at this exit point
+        for (rname, rreg) in results {
+            let v = format!("v_{}", sanitize(rname));
+            if !vars.contains(&v) {
                 vars.push(v.clone());
                 script.push_str(&format!("(declare-const {v} Int)\n"));
             }
-            // results: interval facts at this exit point
-            for (rname, rreg) in &sym.contracts.results {
-                let v = format!("v_{}", sanitize(rname));
-                if !vars.contains(&v) {
-                    vars.push(v.clone());
-                    script.push_str(&format!("(declare-const {v} Int)\n"));
-                }
-                let fact = exit_state.get(*rreg);
-                if let Some(a) = Self::interval_assert(rname, fact) {
-                    script.push_str(&a);
-                    script.push('\n');
+            let fact = exit_state.get(*rreg);
+            if let Some(a) = Self::interval_assert(rname, fact) {
+                script.push_str(&a);
+                script.push('\n');
+            }
+        }
+        script.push_str(&format!("(assert (not {formula}))\n(check-sat)\n"));
+        if !vars.is_empty() {
+            script.push_str(&format!("(get-value ({}))\n", vars.join(" ")));
+        }
+        match z3.run(&script, &vars) {
+            Some((true, model)) => {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::Contract,
+                        kind,
+                        format!(
+                            "`{fn_name}` cannot prove its {} contract at {what}{}",
+                            if kind == "verify-invariant" { "`invariant`" } else { "`ensures`" },
+                            if model.is_empty() { String::new() } else { format!(" — counterexample: {model}") }
+                        ),
+                        exit_span,
+                    )
+                    .with_label(label, cspan, false),
+                );
+            }
+            Some((false, _)) => {}
+            None => {
+                if !self.smt_warned {
+                    self.smt_warned = true;
+                    self.diags.push(Diagnostic::warn(
+                        DiagCode::Semantic,
+                        "verify-smt-unavailable",
+                        "z3 timed out or failed — remaining contract checks skipped",
+                        exit_span,
+                    ));
                 }
             }
-            script.push_str(&format!("(assert (not {formula}))\n(check-sat)\n"));
-            if !vars.is_empty() {
-                script.push_str(&format!("(get-value ({}))\n", vars.join(" ")));
+        }
+    }
+
+    fn check_call(&mut self, sym: usize, span: Span, st: &State) {
+        let Some(callee) = self.module.symbols.get(sym) else { return };
+        if callee.contracts.requires.is_empty() && callee.contracts.invariants.is_empty() {
+            return;
+        }
+        // Clone the small contract tables: the diagnostic methods borrow
+        // `self` mutably while the symbol is borrowed from `self.module`.
+        let callee_name = callee.name.clone();
+        let params = callee.contracts.params.clone();
+        let requires = callee.contracts.requires.clone();
+        let invariants = callee.contracts.invariants.clone();
+        let result_names: Vec<String> =
+            callee.contracts.results.iter().map(|(n, _)| n.clone()).collect();
+
+        for (clause, cspan) in &requires {
+            self.check_call_clause(
+                &callee_name,
+                &params,
+                clause,
+                *cspan,
+                span,
+                st,
+                "verify-requires",
+                "the callee requires this at entry",
+            );
+        }
+        for (clause, cspan) in &invariants {
+            // At a call site result registers are outputs, not inputs: an
+            // invariant that mentions a result can only be checked at exits.
+            if expr_mentions_any(clause, &result_names) {
+                continue;
             }
-            match z3.run(&script, &vars) {
-                Some((true, model)) => {
-                    self.diags.push(
-                        Diagnostic::error(
-                            DiagCode::Contract,
-                            "verify-ensures",
-                            format!(
-                                "`{}` cannot prove its `ensures` contract at {}{}",
-                                sym.name,
-                                what,
-                                if model.is_empty() { String::new() } else { format!(" — counterexample: {model}") }
-                            ),
-                            exit_span,
-                        )
-                        .with_label("the function promises this at every exit", *cspan, false),
-                    );
-                }
-                Some((false, _)) => {}
-                None => {
-                    if !self.smt_warned {
-                        self.smt_warned = true;
-                        self.diags.push(Diagnostic::warn(
-                            DiagCode::Semantic,
-                            "verify-smt-unavailable",
-                            "z3 timed out or failed — remaining contract checks skipped",
-                            exit_span,
-                        ));
-                    }
-                }
-            }
+            self.check_call_clause(
+                &callee_name,
+                &params,
+                clause,
+                *cspan,
+                span,
+                st,
+                "verify-invariant",
+                "the callee promises this at entry and exit",
+            );
+        }
+    }
+
+    fn check_exits(&mut self, exit_state: &State, exit_span: Span, what: &str) {
+        let sym = &self.module.symbols[self.body.symbol];
+        if sym.contracts.ensures.is_empty() && sym.contracts.invariants.is_empty() {
+            return;
+        }
+        let fn_name = sym.name.clone();
+        let params = sym.contracts.params.clone();
+        let results = sym.contracts.results.clone();
+        let ensures = sym.contracts.ensures.clone();
+        let invariants = sym.contracts.invariants.clone();
+
+        for (clause, cspan) in &ensures {
+            self.check_exit_clause(
+                &fn_name,
+                &params,
+                &results,
+                clause,
+                *cspan,
+                exit_state,
+                exit_span,
+                what,
+                "verify-ensures",
+                "the function promises this at every exit",
+            );
+        }
+        for (clause, cspan) in &invariants {
+            self.check_exit_clause(
+                &fn_name,
+                &params,
+                &results,
+                clause,
+                *cspan,
+                exit_state,
+                exit_span,
+                what,
+                "verify-invariant",
+                "the invariant must hold at every exit",
+            );
         }
     }
 

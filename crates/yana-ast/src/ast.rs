@@ -24,6 +24,11 @@ pub enum Item {
     ConstFn(ConstFnItem),
     /// `bind` at top level — a data-section binding (§7).
     Static(StaticBind),
+    /// `group (name) | places |;` — a named alias for a list of places (§3).
+    /// Visible to every function; local `group` statements shadow it.
+    Group(GroupDecl),
+    /// `struct Name { ... }` — const-only data layout (§8).
+    Struct(StructDecl),
     /// `use path::name;` — a module import (§10).
     ///
     /// `path` is the colon-separated path as written. The last segment is the
@@ -31,6 +36,37 @@ pub enum Item {
     /// directory. `use math::divmod` → file `math.yana`, item `divmod`;
     /// `use lib::math::divmod` → `lib/math.yana`.
     Use { path: Vec<(String, Span)>, span: Span },
+}
+
+/// `struct Name { field: Ty, ... }` (§8): const-only data layout. No runtime
+/// field access; values are built at compile time and emitted as static bytes.
+#[derive(Debug, Clone)]
+pub struct StructDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub fields: Vec<StructField>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct StructField {
+    pub name: String,
+    pub name_span: Span,
+    pub ty: Ty,
+    pub span: Span,
+}
+
+/// A named group of places: `group (str) | rax, stack(16), rbx |;` (§3).
+///
+/// Groups are compile-time aliases — declaring one emits no code. They are
+/// used as a single place in `bind`/`alt`/`push`/`pop`, where they expand to
+/// their members in declaration order.
+#[derive(Debug, Clone)]
+pub struct GroupDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub places: Vec<Place>,
+    pub span: Span,
 }
 
 /// An attribute: `#[name]` or `#[name(args)]` (§1).
@@ -136,6 +172,9 @@ pub struct FnItem {
     pub sig: FnSig,
     /// Clobber list (§5.4). `None` = derive by analysis (later pass).
     pub clobbers: Option<Clobbers>,
+    /// `preserves: rbx, rbp, ...` (§5.4) — registers this function promises
+    /// not to destroy. Checked against the derived clobbers.
+    pub preserves: Option<Clobbers>,
     /// §14.4 minimal contracts (`requires`/`ensures`, SPEC §15 ✅ 30.10).
     pub contracts: Contracts,
     pub body: Block,
@@ -145,6 +184,11 @@ pub struct FnItem {
 impl FnItem {
     pub fn is_entry(&self) -> bool {
         self.attrs.iter().any(|a| a.has_name("entry"))
+    }
+
+    /// `#[naked]` (§5.6) — no compiler-generated prologue/epilogue.
+    pub fn is_naked(&self) -> bool {
+        self.attrs.iter().any(|a| a.has_name("naked"))
     }
 }
 
@@ -163,11 +207,13 @@ pub struct Clobbers {
 pub struct Contracts {
     pub requires: Vec<Sp<ConstExpr>>,
     pub ensures: Vec<Sp<ConstExpr>>,
+    /// `invariant <expr>;` — promised at entry AND at every exit (§14.4).
+    pub invariants: Vec<Sp<ConstExpr>>,
 }
 
 impl Contracts {
     pub fn is_empty(&self) -> bool {
-        self.requires.is_empty() && self.ensures.is_empty()
+        self.requires.is_empty() && self.ensures.is_empty() && self.invariants.is_empty()
     }
 }
 
@@ -179,6 +225,8 @@ pub struct ExternFnItem {
     pub abi: Option<String>,
     pub sig: FnSig,
     pub clobbers: Option<Clobbers>,
+    /// `preserves: ...` — accepted on externs for symmetry (§5.4).
+    pub preserves: Option<Clobbers>,
     /// §14.4 minimal contracts — accepted on externs for symmetry; pass 4
     /// only checks call sites against them (no body to verify ensures on).
     pub contracts: Contracts,
@@ -244,6 +292,9 @@ pub enum ConstExpr {
     Tuple { items: Vec<ConstExpr>, span: Span },
     /// Array repeat `[v; n]`.
     Repeat { value: Box<ConstExpr>, count: Box<ConstExpr>, span: Span },
+    /// `b"..."` byte string (§1). Evaluates to a little-endian integer when it
+    /// fits in 8 bytes, otherwise to an array of `u8` values.
+    Bytes { bytes: Vec<u8>, span: Span },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,6 +338,9 @@ pub enum Stmt {
     /// `bind [mut] name @ place[: ty] [= init];` (§3). Initial write needs no `alt`.
     Bind {
         mutable: bool,
+        /// `bind volatile` (§12) — every access through this binding is a
+        /// volatile access the analysis may not elide.
+        volatile: bool,
         name: Option<String>,
         name_span: Span,
         place: Place,
@@ -323,6 +377,16 @@ pub enum Stmt {
     /// `align N;` (§4.3 🟡) — pad the stack so rsp ≡ 0 (mod N) at this point.
     /// The static depth from the stack analysis decides the padding.
     Align { align: u64, span: Span },
+    /// `group (name) | places |;` (§3) — block-scoped group alias.
+    Group(GroupDecl),
+    /// `breakpoint;` — `int3`, a debugger breakpoint (§4.6).
+    Breakpoint { span: Span },
+    /// `trap;` — `ud2`, deliberate unreachable (§4.6).
+    Trap { span: Span },
+    /// `assert (cond);` — `ud2` when the condition does not hold (§4.6).
+    Assert { cond: BranchCond, span: Span },
+    /// `debug { ... }` — body included only in debug builds (§4.6).
+    Debug(Block),
     /// `branch (cond)? => 'label;` (§4.4).
     Branch {
         cond: Option<BranchCond>,
@@ -482,6 +546,9 @@ pub enum Value {
     Place(Place),
     Imm { value: i128, span: Span },
     Str { bytes: Vec<u8>, span: Span },
+    /// `b"..."` byte string (§1). Usable as static data, or as a ≤8-byte
+    /// little-endian immediate.
+    Bytes { bytes: Vec<u8>, span: Span },
     /// `&name` / `&@[...]` — lea source (§3).
     AddrOf { place: Box<Place>, span: Span },
     /// `expr as T` — cast (§4.2).
@@ -503,6 +570,7 @@ impl Value {
             Value::Place(p) => p.span(),
             Value::Imm { span, .. }
             | Value::Str { span, .. }
+            | Value::Bytes { span, .. }
             | Value::AddrOf { span, .. }
             | Value::Cast { span, .. }
             | Value::Mul { span, .. }

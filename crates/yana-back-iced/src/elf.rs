@@ -225,11 +225,11 @@ pub fn link_exe(module: &Module) -> Result<Vec<u8>, crate::encode::AsmError> {
     Ok(out)
 }
 
-fn align(x: usize, a: usize) -> usize {
+pub(crate) fn align(x: usize, a: usize) -> usize {
     (x + a - 1) / a * a
 }
 
-fn section_bytes_of(module: &Module, kind: SectionKind) -> (Vec<u8>, u64) {
+pub(crate) fn section_bytes_of(module: &Module, kind: SectionKind) -> (Vec<u8>, u64) {
     for sec in &module.sections {
         if sec.kind == kind {
             return section_bytes(sec);
@@ -238,7 +238,7 @@ fn section_bytes_of(module: &Module, kind: SectionKind) -> (Vec<u8>, u64) {
     (Vec::new(), 0)
 }
 
-fn bss_size_of(module: &Module) -> u64 {
+pub(crate) fn bss_size_of(module: &Module) -> u64 {
     for sec in &module.sections {
         if sec.kind == SectionKind::Bss {
             return section_bytes(sec).1;
@@ -271,14 +271,14 @@ fn add_section_symbols(
     count
 }
 
-fn intern(strtab: &mut Vec<u8>, name: &str) -> u32 {
+pub(crate) fn intern(strtab: &mut Vec<u8>, name: &str) -> u32 {
     let off = strtab.len() as u32;
     strtab.extend_from_slice(name.as_bytes());
     strtab.push(0);
     off
 }
 
-fn sym_entry(name: u32, value: u64, size: u64, info: u8, shndx: u16) -> [u8; 24] {
+pub(crate) fn sym_entry(name: u32, value: u64, size: u64, info: u8, shndx: u16) -> [u8; 24] {
     let mut b = [0u8; 24];
     b[0..4].copy_from_slice(&name.to_le_bytes());
     b[4] = info;

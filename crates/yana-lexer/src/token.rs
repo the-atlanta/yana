@@ -27,6 +27,11 @@ pub enum Token {
     #[regex(r#""([^"\\\n]|\\.)*""#, str_payload)]
     Str(String),
 
+    /// `b"..."` — byte string; raw source text including the `b` prefix and
+    /// quotes, unescaped in the parser (§1). Longest-match beats `Ident("b")`.
+    #[regex(r#"b"([^"\\\n]|\\.)*""#, str_payload)]
+    ByteStr(String),
+
     /// identifier / register name / section name (`.rodata` — leading dot).
     /// `_` is a valid ident and the parser treats it as the discard place (§3).
     #[regex(r"[A-Za-z_][A-Za-z0-9_]*", str_payload)]
@@ -60,6 +65,20 @@ pub enum Token {
     #[token("if")] KwIf,
     #[token("else")] KwElse,
     #[token("let")] KwLet,
+    /// `group (name) | places |;` (§3) — a named alias for a list of places.
+    #[token("group")] KwGroup,
+    /// `struct Name { field: Ty, ... }` — const-only data layout (§2/§8).
+    #[token("struct")] KwStruct,
+    /// `stack` / `stack(N)` — a frame slot inside a group or as a place.
+    #[token("stack")] KwStack,
+    /// `breakpoint;` → `int3` (§4.6).
+    #[token("breakpoint")] KwBreakpoint,
+    /// `trap;` → `ud2` (§4.6).
+    #[token("trap")] KwTrap,
+    /// `assert (cond);` → `ud2` when false (§4.6).
+    #[token("assert")] KwAssert,
+    /// `debug { ... }` — debug-only block (§4.6).
+    #[token("debug")] KwDebug,
 
     // reserved for the future (§1) — tokenized so we can give a clear
     // "reserved keyword" diagnostic instead of a generic parse error.
@@ -209,6 +228,7 @@ impl std::fmt::Display for Token {
             Token::Num(s) => write!(f, "{s}"),
             Token::Char(c) => write!(f, "'{}'", *c as char),
             Token::Str(s) => write!(f, "{s}"),
+            Token::ByteStr(s) => write!(f, "{s}"),
             Token::Ident(s) => write!(f, "{s}"),
             Token::LabelRef(s) => write!(f, "'{s}"),
             Token::BadNum(b) => write!(f, "{}", b.text),

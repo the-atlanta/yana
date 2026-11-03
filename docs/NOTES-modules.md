@@ -2,8 +2,8 @@
 
 Branch: `feat/modules`. Scope: BOTH stages of §10 — one-object-file-per-source
 file with `#[global]` exports (stage 1) AND `use path::name;` imports of
-`fn`/`extern fn` signatures, `const` values and statics (stage 2). Macro
-imports are OUT of scope (another branch does macros).
+`fn`/`extern fn` signatures, `const` values, statics and macros (stage 2).
+Macro imports were added later (F13, M6).
 
 ## Binding decisions
 
@@ -138,3 +138,24 @@ clobber list. Documented; the fixture declares its block explicitly.
   `yana run` same; `--object` emits ET_REL with UND imports; two `--object`
   outputs link with plain `ld` and run;
 - baseline: workspace green, oracle MATCH ×2, hello prints, factorial 120.
+
+## Macro imports (F13)
+
+Macros are expanded by the parser pre-pass (§9), so they are not `Item`s and
+`extract_decl` cannot see them. The loader handles them explicitly:
+
+1. Parse the importer once to discover `use` items. Diagnostics from this
+   pass are **deferred**: an imported macro invocation is still unknown.
+2. For each `use`, after loading the dependency, if `extract_decl` returns
+   `Unresolved`, check the dependency's token stream:
+   - `yana_parser::macros::collect_exports(&dep.source)` returns macros
+     declared with `#[global]`;
+   - `defines_macro(&dep.source, name)` distinguishes "missing item" from
+     "declared but not exported" for the `unresolved-import` help.
+3. Reparse the importer with `yana_parser::parse_with_prelude(source, &prelude)`
+   and keep only those diagnostics. Imported definitions are marked `foreign`,
+   so expanded tokens are remapped to the invocation span.
+4. A local macro of the same name overrides an imported one.
+
+`#[global]` is recognized before either `macro` or `macro_rules!`; the
+attribute is consumed by the pre-pass and never reaches the grammar.

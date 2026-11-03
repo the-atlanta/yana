@@ -1,0 +1,9 @@
+use macro_def::add_to;
+use macro_def::exit_with;
+
+#[entry]
+fn main() -> ! {
+    bind mut n @ rbx: u64 = 30;
+    add_to!(n, 12);
+    exit_with!(n);
+}

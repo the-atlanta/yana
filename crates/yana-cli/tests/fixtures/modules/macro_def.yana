@@ -1,0 +1,18 @@
+// Macro exports for §10 import tests.
+
+#[global]
+macro exit_with(code: value) {
+    alt rax = 60;
+    alt rdi = code;
+    syscall;
+}
+
+#[global]
+macro add_to(dst: place, amount: value) {
+    alt dst += amount;
+}
+
+// Not exported: `use macro_def::hidden;` must fail with "not exported".
+macro hidden(x: value) {
+    alt rax = x;
+}
