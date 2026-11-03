@@ -20,6 +20,7 @@ pub struct Item {
 pub fn keywords() -> Vec<Item> {
     let mut v = vec![
         Item { label: "bind", detail: "привязка места (§3)", docs: "bind [mut] имя @ место: тип [= значение]; повторный bind с тем же именем затеняет прежнюю привязку (Rust-style shadowing).", insert: Some("bind ${1:mut }${2:name} @ ${3:rax}: ${4:u64} = ${5:0};") },
+        Item { label: "unbind", detail: "освободить привязку (§3)", docs: "unbind name; — снимает привязку и освобождает регистр для нового имени. Только в текущем блоке; параметры и внешние привязки нельзя.", insert: Some("unbind ${1:name};") },
         Item { label: "alt", detail: "запись в место (§4.2)", docs: "alt требует mut-привязки и уже объявленного места: регистр должен быть параметром, результатом или bind-ом (включая bind _ @ reg). Не нужна для bind-инициализации и команд (pop/call/syscall/return).", insert: Some("alt ${1:dst} ${2:=} ${3:src};") },
         Item { label: "push", detail: "в стек, порядок написания (§4.3)", docs: "push { a, b }; — раскрывается в написанном порядке; `_` = пустой слот 8 байт (lea rsp).", insert: Some("push { ${1:rbx} };") },
         Item { label: "pop", detail: "из стека, порядок написания (§4.3)", docs: "pop { b, a }; — порядок не разворачивается.", insert: Some("pop { ${1:rbx} };") },

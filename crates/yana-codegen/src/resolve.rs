@@ -45,6 +45,8 @@ struct Binding {
     /// `bind volatile` (§12): writes through this binding are wrapped in
     /// [`Insn::Volatile`] so no analysis may elide them.
     volatile: bool,
+    /// Parameters live for the whole function and cannot be `unbind`-ed.
+    is_param: bool,
     span: Span,
 }
 
@@ -1285,7 +1287,7 @@ impl Resolver {
         for (p, pinfo) in f.sig.params.iter().zip(info.params.iter()) {
             let ty = p.ty().cloned().unwrap_or(Ty::U64);
             let operand = pinfo.operand.clone();
-            self.define(p.name.clone(), Binding { operand, ty, mutable: p.mutable, volatile: false, span: p.span });
+            self.define(p.name.clone(), Binding { operand, ty, mutable: p.mutable, volatile: false, is_param: true, span: p.span });
         }
 
         self.lower_block(&f.body);
@@ -1547,6 +1549,7 @@ impl Resolver {
                             ty,
                             mutable: *mutable,
                             volatile: *volatile,
+                            is_param: false,
                             span: *span,
                         },
                     );
@@ -1559,6 +1562,9 @@ impl Resolver {
                         self.wrap_volatile(before);
                     }
                 }
+            }
+            Stmt::Unbind { name, name_span, span } => {
+                self.lower_unbind(name, *name_span, *span);
             }
             Stmt::Alt { dst, op, src, modifier, span } => {
                 let vol = *modifier == AltModifier::None
@@ -1766,6 +1772,63 @@ impl Resolver {
         });
         self.emit(Insn::Jcc { cc, label: def });
         self.emit(Insn::Ud2);
+    }
+
+    /// `unbind name;` (§3): release the binding so its register is free for a
+    /// different name. Only bindings of the current block can be released;
+    /// parameters live for the whole function and are rejected.
+    fn lower_unbind(&mut self, name: &str, name_span: Span, span: Span) {
+        if name == "_" {
+            self.err(
+                "unbind-discard",
+                "`_` is not a binding and cannot be unbound",
+                name_span,
+            );
+            return;
+        }
+        let mut found: Option<(usize, Binding)> = None;
+        for (idx, scope) in self.scopes.iter().enumerate().rev() {
+            if let Some(b) = scope.get(name) {
+                found = Some((idx, b.clone()));
+                break;
+            }
+        }
+        let Some((idx, binding)) = found else {
+            self.err(
+                "unknown-name",
+                format!("`{name}` is not bound here{}", self.suggest(name)),
+                name_span,
+            );
+            return;
+        };
+        if idx + 1 != self.scopes.len() {
+            self.err_help(
+                "unbind-scope",
+                format!("`{name}` is bound in an outer block; `unbind` only releases bindings of the current block"),
+                "move `unbind` into the block where the binding was declared, or shadow the name with a new `bind`",
+                name_span,
+            );
+            return;
+        }
+        if binding.is_param {
+            self.err_help(
+                "unbind-param",
+                format!("`{name}` is a parameter and lives for the whole function"),
+                "bind the parameter value to a new name and `unbind` that name instead",
+                name_span,
+            );
+            return;
+        }
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.remove(name);
+        }
+        if let Operand::Reg(r) = &binding.operand {
+            let r64 = r.resize(yana_ast::reg::RegSize::R64).unwrap_or(*r);
+            if self.body.reg_names.get(&r64) == Some(&name.to_string()) {
+                self.body.reg_names.remove(&r64);
+            }
+        }
+        let _ = span;
     }
 
     /// Is `r` already declared/used by this function? Parameters and result
@@ -2408,7 +2471,7 @@ impl Resolver {
             (CallResults::Single { name: Some(n), .. }, RetInfo::Single { operand, ty }) => {
                 self.define(
                     n.clone(),
-                    Binding { operand: operand.clone(), ty: ty.clone(), mutable: false, volatile: false, span },
+                    Binding { operand: operand.clone(), ty: ty.clone(), mutable: false, volatile: false, is_param: false, span },
                 );
             }
             (CallResults::Single { name: Some(n), .. }, RetInfo::None) => {
@@ -2430,6 +2493,7 @@ impl Resolver {
                                 ty: part.ty.clone(),
                                 mutable: false,
                                 volatile: false,
+                                is_param: false,
                                 span,
                             },
                         );
@@ -3217,6 +3281,7 @@ impl Resolver {
                                 ty,
                                 mutable: p.mutable,
                                 volatile: false,
+                                is_param: false,
                                 span: p.span,
                             },
                         );
@@ -3241,7 +3306,8 @@ enum LeaSrc {
 
 fn stmt_span(s: &Stmt) -> Span {
     match s {
-        Stmt::Bind { span, .. }
+        Stmt::Unbind { span, .. }
+        | Stmt::Bind { span, .. }
         | Stmt::Alt { span, .. }
         | Stmt::DivMod { span, .. }
         | Stmt::Push { span, .. }

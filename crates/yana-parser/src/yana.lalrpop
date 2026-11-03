@@ -24,6 +24,7 @@ extern {
 
     enum Token {
         "bind"     => Token::KwBind,
+        "unbind"   => Token::KwUnbind,
         "mut"      => Token::KwMut,
         "alt"      => Token::KwAlt,
         "push"     => Token::KwPush,
@@ -682,6 +683,9 @@ Stmt: Stmt = {
             span: Span::new(lo as u32, hi as u32),
         }
     },
+    // unbind name; — release a binding and its register (§3)
+    <lo: @L> "unbind" <i: IdentSp> ";" <hi: @R> =>
+        Stmt::Unbind { name: i.v, name_span: i.span, span: Span::new(lo as u32, hi as u32) },
     // `group (name) | places |;` (§3) — block-scoped alias
     <g: GroupDecl> => Stmt::Group(g),
     // debug statements (§4.6)

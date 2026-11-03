@@ -349,6 +349,13 @@ pub enum Stmt {
         pattern: Option<Vec<Param>>,
         span: Span,
     },
+    /// `unbind name;` (§3) — release a binding so its register is free for a
+    /// different name (the reverse of `bind`).
+    Unbind {
+        name: String,
+        name_span: Span,
+        span: Span,
+    },
     /// `alt [modifier] dst <op>= src;` (§4.1, §4.2; §12 for the modifiers).
     Alt {
         dst: Place,

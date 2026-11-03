@@ -803,6 +803,75 @@ fn f() -> rax: u64 {
 }
 
 #[test]
+fn unbind_frees_register_for_a_new_name() {
+    // §3: `unbind` releases the name and its register, so a different name
+    // may take the same register afterwards (no reg-conflict).
+    let src = r#"
+fn f() -> rax: u64 {
+    bind n @ rcx: u64 = 1;
+    unbind n;
+    bind n10 @ rcx: u64 = 2;
+    alt rax = n10;
+    return;
+}
+"#;
+    let (module, diags) = resolve(src);
+    assert!(
+        !diags.iter().any(|d| matches!(d.level, yana_ast::DiagLevel::Error)),
+        "unbind must free the register: {:?}",
+        diags.iter().map(|d| (&d.kind, &d.message)).collect::<Vec<_>>()
+    );
+    let body = &module.bodies[0];
+    let rcx = yana_ast::Reg::parse("rcx").unwrap();
+    assert_eq!(body.reg_names.get(&rcx).map(String::as_str), Some("n10"));
+
+    let text = yana_back_iced::assemble_text(&module, Some(yana_back_iced::Layout::default_x86_64()))
+        .expect("assemble");
+    let joined = yana_back_iced::disassemble(&text.text, 0).join("\n");
+    assert!(joined.contains("mov rcx,1"), "{joined}");
+    assert!(joined.contains("mov rcx,2"), "{joined}");
+    assert!(joined.contains("mov rax,rcx"), "{joined}");
+}
+
+#[test]
+fn unbind_makes_alt_on_the_register_unbound() {
+    let src = r#"
+fn f() {
+    bind n @ rcx: u64 = 1;
+    unbind n;
+    alt rcx = 2;
+    return;
+}
+"#;
+    let (_, diags) = resolve(src);
+    assert!(
+        diags.iter().any(|d| d.kind == "alt-unbound-reg"),
+        "expected alt-unbound-reg after unbind: {:?}",
+        diags.iter().map(|d| &d.kind).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn unbind_rejects_params_outer_scope_and_unknown_names() {
+    let src = r#"
+fn f(p @ rdi: u64) {
+    bind outer @ rcx: u64 = 1;
+    {
+        unbind outer;
+    }
+    unbind p;
+    unbind missing;
+    return;
+}
+"#;
+    let (_, diags) = resolve(src);
+    let kinds: Vec<&str> = diags.iter().map(|d| d.kind.as_str()).collect();
+    assert!(kinds.contains(&"unbind-param"), "{kinds:?}");
+    assert!(kinds.contains(&"unbind-scope"), "{kinds:?}");
+    assert!(kinds.contains(&"unknown-name"), "{kinds:?}");
+}
+
+#[test]
 fn reg_conflict_underlines_name_and_offers_fixes() {
     let src = "fn f() {\n    bind a @ rax: u64 = 1;\n    bind aa @ rax: u64 = 2;\n    return;\n}\n";
     let (_, diags) = resolve(src);

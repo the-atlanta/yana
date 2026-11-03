@@ -42,6 +42,8 @@ pub enum Token {
 
     // ---- keywords ----
     #[token("bind")] KwBind,
+    /// `unbind name;` — release a binding and its register (§3).
+    #[token("unbind")] KwUnbind,
     #[token("mut")] KwMut,
     #[token("alt")] KwAlt,
     #[token("push")] KwPush,
