@@ -71,6 +71,19 @@ enum Cmd {
         #[arg(long)]
         release: bool,
     },
+    /// Print the SSA-IR in LLVM syntax (values, phis, bind metadata)
+    Ir {
+        file: PathBuf,
+        /// Suppress `[resolve]`/`[ssa]`/`[abi]`/`[opt]` annotations
+        #[arg(long)]
+        no_comments: bool,
+        /// Suppress the statistics header
+        #[arg(long)]
+        no_stats: bool,
+        /// Suppress `!span`/`!bind` metadata and the metadata section
+        #[arg(long)]
+        no_metadata: bool,
+    },
     /// Print the resolved IR, one instruction per line (§14 pass 2)
     Expand {
         file: PathBuf,
@@ -130,6 +143,9 @@ where
             cmd_build(&file, out, backend, object, strict, verify, release, &target)
         }
         Cmd::Run { file, strict, release } => cmd_run(&file, strict, release),
+        Cmd::Ir { file, no_comments, no_stats, no_metadata } => {
+            cmd_ir(&file, no_comments, no_stats, no_metadata)
+        }
         Cmd::Expand { file, macros } => cmd_expand(&file, macros),
         Cmd::Nasm { file, out, assemble } => cmd_nasm(&file, out, assemble),
         Cmd::Oracle { file } => cmd_oracle(&file),
@@ -571,6 +587,21 @@ fn cmd_verify(path: &Path) -> i32 {
         }
     }
     fatal as i32
+}
+
+fn cmd_ir(path: &Path, no_comments: bool, no_stats: bool, no_metadata: bool) -> i32 {
+    let Some(loaded) = load(path) else { return 2 };
+    let Some(module) = resolve(&loaded, false) else { return 1 };
+    let ssa = yana_ir::lift_module(&module, &loaded.name);
+    let opts = yana_ir::PrintOptions {
+        comments: !no_comments,
+        stats: !no_stats,
+        metadata: !no_metadata,
+        source_text: Some(&loaded.source),
+        module_name: Some(&loaded.name),
+    };
+    print!("{}", yana_ir::print_module(&ssa, &opts));
+    0
 }
 
 fn cmd_expand(path: &Path, macros: bool) -> i32 {

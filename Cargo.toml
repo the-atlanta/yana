@@ -5,9 +5,11 @@ members = [
     "crates/yana-lexer",
     "crates/yana-parser",
     "crates/yana-codegen",
+    "crates/yana-ir",
     "crates/yana-analysis",
     "crates/yana-back-iced",
     "crates/yana-back-nasm",
+    "crates/yana-back-aarch64",
     "crates/yana-cli",
     "crates/yana-lsp",
     "crates/yana-knowledge",
@@ -26,9 +28,11 @@ yana-ast = { path = "crates/yana-ast" }
 yana-lexer = { path = "crates/yana-lexer" }
 yana-parser = { path = "crates/yana-parser" }
 yana-codegen = { path = "crates/yana-codegen" }
+yana-ir = { path = "crates/yana-ir" }
 yana-analysis = { path = "crates/yana-analysis" }
 yana-back-iced = { path = "crates/yana-back-iced" }
 yana-back-nasm = { path = "crates/yana-back-nasm" }
+yana-back-aarch64 = { path = "crates/yana-back-aarch64" }
 yana-knowledge = { path = "crates/yana-knowledge" }
 yana-symbols = { path = "crates/yana-symbols" }
 

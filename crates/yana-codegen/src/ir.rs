@@ -12,6 +12,7 @@
 
 use yana_ast::place::SectionKind;
 use yana_ast::reg::Reg;
+use yana_ast::ty::Ty;
 use yana_ast::Span;
 
 use crate::target::TargetInfo;
@@ -50,6 +51,8 @@ impl Module {
 #[derive(Debug, Clone)]
 pub struct Symbol {
     pub name: String,
+    /// Source-level name (`main` even when the target symbol is `_start`).
+    pub source_name: String,
     pub kind: SymbolKind,
     /// Exported (`#[global]`, spec §5.1 — the canonical form since 29.10).
     pub exported: bool,
@@ -66,7 +69,33 @@ pub struct Symbol {
     /// §14.4 minimal contracts (`requires`/`ensures`) — pass 4 reads these
     /// by symbol index at call sites and function exits.
     pub contracts: FnContracts,
+    /// Declared parameter list (types + ABI homes). Empty for non-functions.
+    /// This is the single source of truth for LSP signature help, DAP
+    /// registers and the SSA-IR printer — no re-parsing of the AST.
+    pub params: Vec<SymParam>,
+    /// Declared return shape (`-> ()`, `-> rax: u64`, `-> !`, tuple).
+    pub ret: SymRet,
     pub span: Span,
+}
+
+/// One declared parameter, resolved to its ABI home.
+#[derive(Debug, Clone)]
+pub struct SymParam {
+    pub name: String,
+    pub ty: Ty,
+    /// Register home for register parameters (`None` for `stack` params).
+    pub reg: Option<Reg>,
+    /// `[rbp+N]` offset for stack parameters (§5.3).
+    pub stack: Option<u32>,
+}
+
+/// Declared return shape, resolved to IR-level data.
+#[derive(Debug, Clone)]
+pub enum SymRet {
+    None,
+    Never,
+    Single { reg: Option<Reg>, ty: Ty },
+    Tuple(Vec<SymParam>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -127,6 +156,48 @@ pub struct FnBody {
     /// the call). `0` means balanced. Filled by stack analysis (pass 3) and
     /// copied into [`CallContract::stack_delta`] at every call site.
     pub stack_delta: i32,
+    /// Source-level binding events in instruction order. The resolver is the
+    /// only producer; SSA construction and tooling consume them to attach
+    /// `!bind` metadata to the right value without re-parsing the AST.
+    pub bind_events: Vec<BindEvent>,
+}
+
+/// What a [`BindEvent`] does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindEventKind {
+    Bind(BindKind),
+    /// `unbind name;` — the name is retired at this instruction index.
+    Unbind,
+}
+
+/// How a binding came to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindKind {
+    /// A function parameter (`fd @ rdi`), lives for the whole body.
+    Param,
+    /// `bind name @ place = ...;`
+    Local,
+    /// `bind _ @ place = ...;` — an intentional sink, no name.
+    Discard,
+    /// The `-> rax` return place, declared by the signature.
+    ReturnPlace,
+}
+
+/// One binding event, keyed by the flat instruction index at which it happens.
+#[derive(Debug, Clone)]
+pub struct BindEvent {
+    /// Index into [`FnBody::insns`] where the binding takes effect (the first
+    /// instruction of the initializer, or the next instruction for an alias).
+    pub insn: usize,
+    pub span: Span,
+    pub name: String,
+    /// Register home, when the place is a register.
+    pub reg: Option<Reg>,
+    pub ty: Ty,
+    pub kind: BindEventKind,
+    /// `true` when the binding's initializer writes the value at `insn`
+    /// (`bind n @ rax = 1`); `false` for a pure alias (`bind n @ rax`).
+    pub has_init: bool,
 }
 
 /// The §14.4 contract clauses of one function symbol, resolved to IR-level

@@ -18,9 +18,9 @@ use yana_ast::{
 use crate::consteval::{self, ConstEnv, Value as CValue};
 use crate::insn;
 use crate::ir::{
-    AtomicOp, BranchUse, CallContract, DataItem, Displacement, FnBody, FnContracts, Insn, Jcc,
-    LabelDef, MemOp, MemOrder, Module, Operand, SectionData, SpannedInsn, Symbol, SymbolKind,
-    WideOp,
+    AtomicOp, BindEvent, BindEventKind, BindKind, BranchUse, CallContract, DataItem, Displacement,
+    FnBody, FnContracts, Insn, Jcc, LabelDef, MemOp, MemOrder, Module, Operand, SectionData,
+    SpannedInsn, SymParam, SymRet, Symbol, SymbolKind, WideOp,
 };
 use crate::target::{Arch, ImportedDecl, ResolveOptions, TargetInfo};
 
@@ -364,6 +364,7 @@ impl Resolver {
                     let sym = self.module.symbols.len();
                     self.module.symbols.push(Symbol {
                         name: name.clone(),
+                        source_name: name.clone(),
                         kind: SymbolKind::Const { value },
                         exported: false,
                         syscall: None,
@@ -371,6 +372,8 @@ impl Resolver {
                         preserves: vec![],
                         naked: false,
                         contracts: FnContracts::default(),
+                        params: Vec::new(),
+                        ret: SymRet::None,
                         span: Span::DUMMY,
                     });
                     self.consts.insert(name.clone(), value);
@@ -382,6 +385,7 @@ impl Resolver {
                     let sym = self.module.symbols.len();
                     self.module.symbols.push(Symbol {
                         name: name.clone(),
+                        source_name: name.clone(),
                         kind: SymbolKind::ExternStatic { size },
                         exported: true,
                         syscall: None,
@@ -389,6 +393,8 @@ impl Resolver {
                         preserves: vec![],
                         naked: false,
                         contracts: FnContracts::default(),
+                        params: Vec::new(),
+                        ret: SymRet::None,
                         span: Span::DUMMY,
                     });
                     self.statics.insert(
@@ -775,6 +781,7 @@ impl Resolver {
         let sym = self.module.symbols.len();
         self.module.symbols.push(Symbol {
             name: s.name.clone(),
+            source_name: s.name.clone(),
             kind: SymbolKind::Static { section, offset, size },
             exported: s.attrs.iter().any(|a| a.has_name("global")),
             syscall: None,
@@ -782,6 +789,8 @@ impl Resolver {
             preserves: vec![],
             naked: false,
             contracts: FnContracts::default(),
+            params: Vec::new(),
+            ret: SymRet::None,
             span: s.span,
         });
         let sec = self.module.section_mut(section);
@@ -870,6 +879,7 @@ impl Resolver {
         let sym = self.module.symbols.len();
         self.module.symbols.push(Symbol {
             name: c.name.clone(),
+            source_name: c.name.clone(),
             kind: SymbolKind::Const { value: 0 },
             exported: false,
             syscall: None,
@@ -877,6 +887,8 @@ impl Resolver {
             preserves: vec![],
             naked: false,
             contracts: FnContracts::default(),
+            params: Vec::new(),
+            ret: SymRet::None,
             span: c.span,
         });
         self.consts.insert(c.name.clone(), 0); // patched by eval_const
@@ -1060,8 +1072,46 @@ impl Resolver {
             SymbolKind::Function { body_index: usize::MAX }
         };
 
+        let sym_params = params
+            .iter()
+            .map(|p| SymParam {
+                name: p.name.clone(),
+                ty: p.ty.clone(),
+                reg: match &p.operand {
+                    Operand::Reg(r) => Some(*r),
+                    _ => None,
+                },
+                stack: p.stack,
+            })
+            .collect();
+        let sym_ret = match &ret {
+            RetInfo::None => SymRet::None,
+            RetInfo::Never => SymRet::Never,
+            RetInfo::Single { operand, ty } => SymRet::Single {
+                reg: match operand {
+                    Operand::Reg(r) => Some(*r),
+                    _ => None,
+                },
+                ty: ty.clone(),
+            },
+            RetInfo::Tuple { parts } => SymRet::Tuple(
+                parts
+                    .iter()
+                    .map(|p| SymParam {
+                        name: p.name.clone(),
+                        ty: p.ty.clone(),
+                        reg: match &p.operand {
+                            Operand::Reg(r) => Some(*r),
+                            _ => None,
+                        },
+                        stack: None,
+                    })
+                    .collect(),
+            ),
+        };
         self.module.symbols.push(Symbol {
             name,
+            source_name: sig.name.clone(),
             kind,
             exported: exported || is_entry || syscall.is_some(),
             syscall,
@@ -1069,6 +1119,8 @@ impl Resolver {
             preserves,
             naked,
             contracts,
+            params: sym_params,
+            ret: sym_ret,
             span,
         });
 
@@ -1270,6 +1322,7 @@ impl Resolver {
             returns_never,
             reg_names: std::collections::HashMap::new(),
             stack_delta: 0,
+            bind_events: Vec::new(),
         };
         self.labels.clear();
         self.pending_jumps.clear();
@@ -1287,6 +1340,7 @@ impl Resolver {
         for (p, pinfo) in f.sig.params.iter().zip(info.params.iter()) {
             let ty = p.ty().cloned().unwrap_or(Ty::U64);
             let operand = pinfo.operand.clone();
+            self.record_bind(&p.name, &operand, &ty, BindKind::Param, 0, p.span, true);
             self.define(p.name.clone(), Binding { operand, ty, mutable: p.mutable, volatile: false, is_param: true, span: p.span });
         }
 
@@ -1400,6 +1454,31 @@ impl Resolver {
             self.body.reg_names = saved;
         }
     }
+    /// Record a source-level binding event for SSA construction/tooling.
+    fn record_bind(
+        &mut self,
+        name: &str,
+        operand: &Operand,
+        ty: &Ty,
+        kind: BindKind,
+        insn: usize,
+        span: Span,
+        has_init: bool,
+    ) {
+        self.body.bind_events.push(BindEvent {
+            insn,
+            span,
+            name: name.to_string(),
+            reg: match operand {
+                Operand::Reg(r) => Some(*r),
+                _ => None,
+            },
+            ty: ty.clone(),
+            kind: BindEventKind::Bind(kind),
+            has_init,
+        });
+    }
+
     fn define(&mut self, name: String, b: Binding) {
         if let Some(top) = self.scopes.last_mut() {
             top.insert(name, b);
@@ -1484,6 +1563,15 @@ impl Resolver {
                 // `_` is the discard (Rust convention, SPEC §11 ✅): rebindable,
                 // holds no name and no register; its writes are intentional sinks.
                 let is_wildcard = name == "_";
+                self.record_bind(
+                    &name,
+                    &operand,
+                    &ty,
+                    if is_wildcard { BindKind::Discard } else { BindKind::Local },
+                    self.body.insns.len(),
+                    *span,
+                    init.is_some(),
+                );
                 // Shadowing (§3): a later `bind name` replaces the earlier one,
                 // even in the same scope (Rust `let`-style). Retire the old
                 // binding's register name so liveness does not keep a stale
@@ -1822,6 +1910,15 @@ impl Resolver {
         if let Some(scope) = self.scopes.last_mut() {
             scope.remove(name);
         }
+        self.body.bind_events.push(BindEvent {
+            insn: self.body.insns.len(),
+            span,
+            name: name.to_string(),
+            reg: None,
+            ty: binding.ty.clone(),
+            kind: BindEventKind::Unbind,
+            has_init: false,
+        });
         if let Operand::Reg(r) = &binding.operand {
             let r64 = r.resize(yana_ast::reg::RegSize::R64).unwrap_or(*r);
             if self.body.reg_names.get(&r64) == Some(&name.to_string()) {
@@ -2469,6 +2566,7 @@ impl Resolver {
     fn bind_results(&mut self, res: &CallResults, info: &FnInfo, span: Span) {
         match (res, &info.ret) {
             (CallResults::Single { name: Some(n), .. }, RetInfo::Single { operand, ty }) => {
+                self.record_bind(n, operand, ty, BindKind::Local, self.body.insns.len().saturating_sub(1), span, true);
                 self.define(
                     n.clone(),
                     Binding { operand: operand.clone(), ty: ty.clone(), mutable: false, volatile: false, is_param: false, span },
@@ -2486,6 +2584,7 @@ impl Resolver {
             (CallResults::Tuple { names, .. }, RetInfo::Tuple { parts }) => {
                 for (name, part) in names.iter().zip(parts) {
                     if let Some(n) = name {
+                        self.record_bind(n, &part.operand, &part.ty, BindKind::Local, self.body.insns.len().saturating_sub(1), span, true);
                         self.define(
                             n.clone(),
                             Binding {
@@ -3273,11 +3372,13 @@ impl Resolver {
                         let ty = p.ty().cloned().unwrap_or(Ty::U64);
                         let imm = Operand::Imm(v.as_int().unwrap_or(0) as i64);
                         let size = ty_bits(&ty, &self.target) as u32;
-                        self.emit(Insn::Mov { dst: op, src: imm, size });
+                        let idx = self.emit(Insn::Mov { dst: op.clone(), src: imm, size });
+                        let operand = self.param_operand(p);
+                        self.record_bind(&p.name, &operand, &ty, BindKind::Local, idx, p.span, true);
                         self.define(
                             p.name.clone(),
                             Binding {
-                                operand: self.param_operand(p),
+                                operand,
                                 ty,
                                 mutable: p.mutable,
                                 volatile: false,

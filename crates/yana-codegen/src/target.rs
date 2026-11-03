@@ -51,6 +51,20 @@ impl TargetInfo {
         TargetInfo { arch: Arch::Xtensa, os: Os::Linux }
     }
 
+    /// The canonical LLVM-style triple for this target.
+    pub fn triple(&self) -> &'static str {
+        match (self.arch, self.os) {
+            (Arch::X86_64, Os::Linux) => "x86_64-unknown-linux-gnu",
+            (Arch::X86_64, Os::Macos) => "x86_64-apple-darwin",
+            (Arch::Aarch64, Os::Linux) => "aarch64-unknown-linux-gnu",
+            (Arch::Xtensa, Os::Linux) => "xtensa-esp32s3-elf",
+            // macOS is only wired for x86-64 today; keep the triple stable
+            // for the other architectures until their backends exist.
+            (Arch::Aarch64, Os::Macos) => "aarch64-apple-darwin",
+            (Arch::Xtensa, Os::Macos) => "xtensa-esp32s3-elf",
+        }
+    }
+
     /// rsp modulo the natural stack alignment at function entry, BEFORE any
     /// of the function's own pushes. SysV x86-64: the `call` pushed the
     /// return address, so rsp ≡ 8 (mod 16) at entry. AArch64 keeps sp
